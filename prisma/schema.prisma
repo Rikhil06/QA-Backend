@@ -23,13 +23,15 @@ model QAReport {
   url        String
   site       String? // ✅ NEW: extracted domain like example.com
   siteName   String?
+  title      String
   comment    String
   x          Int
   y          Int
   imagePath  String
   timestamp  DateTime  @default(now())
   status     String    @default("new") // NEW: 'new', 'in_progress', 'resolved'
-  priority   String    @default("not_assigned") // Not Assigned, Low, Medium, High
+  priority   String // Not Assigned, Low, Medium, High
+  type       String
   resolvedAt DateTime? // NEW: resolution timestamp
   duration   Int? // NEW: resolution duration in minutes
   userName   String
@@ -43,24 +45,43 @@ model QAReport {
   Attachment Attachment[]
   Site       Site?        @relation(fields: [siteId], references: [id])
   siteId     String?
+  activities Activity[]
 
   @@unique([siteId, slug])
 }
 
 model User {
-  id            String       @id @default(cuid())
-  name          String?
-  email         String       @unique
-  emailVerified DateTime?
-  image         String?
-  password      String
-  accounts      Account[]
-  sessions      Session[]
-  qaReports     QAReport[]
-  comments      Comment[]
-  attachments   Attachment[]
-  createdAt     DateTime     @default(now())
-  sites         Site[]       @relation("SiteMembers") // ⬅️ same relation name
+  id                  String       @id @default(cuid())
+  name                String?
+  email               String       @unique
+  emailVerified       DateTime?
+  image               String?
+  password            String
+  accounts            Account[]
+  sessions            Session[]
+  qaReports           QAReport[]
+  comments            Comment[]
+  attachments         Attachment[]
+  createdAt           DateTime     @default(now())
+  sites               Site[]       @relation("SiteMembers") // ⬅️ same relation name
+  activities          Activity[]   @relation("activities") // activities **for this user**
+  performedActivities Activity[]   @relation("performedActivities") // activities **by this user**
+}
+
+model Activity {
+  id        String   @id @default(cuid())
+  userId    String // The user the activity is for
+  actorId   String // Who performed the action
+  type      String // e.g., comment, status, assignment, completed, created
+  reportId  String? // Optional, link to task
+  message   String
+  status    String? // Optional, e.g., "to QA" for status changes
+  createdAt DateTime @default(now())
+  priority  String?
+
+  user   User      @relation("activities", fields: [userId], references: [id])
+  actor  User      @relation("performedActivities", fields: [actorId], references: [id])
+  report QAReport? @relation(fields: [reportId], references: [id])
 }
 
 model Comment {
@@ -71,15 +92,25 @@ model Comment {
   userId      String? // optional
   user        User?        @relation(fields: [userId], references: [id]) // optional relation
   attachments Attachment[]
+  parentId    String?
 
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // 👇 SELF RELATION (this is what creates `replies`)
+  parent  Comment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies Comment[] @relation("CommentReplies")
 }
 
 model Attachment {
-  id        String  @id @default(cuid())
-  url       String
-  commentId String
-  comment   Comment @relation(fields: [commentId], references: [id])
+  id           String  @id @default(cuid())
+  key          String
+  thumbnailKey String?
+  name         String
+  size         Int
+  type         String
+  commentId    String
+  comment      Comment @relation(fields: [commentId], references: [id], onDelete: Cascade)
 
   createdAt  DateTime  @default(now())
   QAReport   QAReport? @relation(fields: [qAReportId], references: [id])
