@@ -3,18 +3,38 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
-  url      = "file:./dev.db"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Plan {
+  free
+  starter
+  team
+  agency
+}
+
+enum NotificationType {
+  SITE_INVITE
+  MENTION
+  TASK_OVERDUE
+  TASK_DUE_TODAY
 }
 
 model Site {
-  id        String     @id @default(cuid())
-  name      String
-  domain    String
-  slug      String
-  reports   QAReport[]
-  users     User[]     @relation("SiteMembers") // ⬅️ relation name
-  createdAt DateTime   @default(now())
+  id            String         @id @default(cuid())
+  name          String
+  url           String
+  domain        String         @unique
+  slug          String
+  archived      Boolean        @default(false)
+  reports       QAReport[]
+  users         User[]         @relation("SiteMembers") // ⬅️ relation name
+  createdAt     DateTime       @default(now())
+  siteUsers     SiteUser[]
+  team          Team?          @relation(fields: [teamId], references: [id])
+  teamId        String?
+  notifications Notification[]
 }
 
 model QAReport {
@@ -23,6 +43,7 @@ model QAReport {
   url        String
   site       String? // ✅ NEW: extracted domain like example.com
   siteName   String?
+  pagePath   String?
   title      String
   comment    String
   x          Int
@@ -35,25 +56,25 @@ model QAReport {
   resolvedAt DateTime? // NEW: resolution timestamp
   duration   Int? // NEW: resolution duration in minutes
   userName   String
+  dueDate    DateTime?
 
   archived   Boolean   @default(false)
   archivedAt DateTime?
 
-  userId     String?
-  user       User?        @relation(fields: [userId], references: [id])
-  Comment    Comment[]
-  Attachment Attachment[]
-  Site       Site?        @relation(fields: [siteId], references: [id])
-  siteId     String?
-  activities Activity[]
-
-  @@unique([siteId, slug])
+  userId        String?
+  user          User?          @relation(fields: [userId], references: [id])
+  Comment       Comment[]
+  Attachment    Attachment[]
+  Site          Site?          @relation(fields: [siteId], references: [id])
+  siteId        String?
+  activities    Activity[]
+  notifications Notification[]
 }
 
 model User {
-  id                  String       @id @default(cuid())
+  id                  String         @id @default(cuid())
   name                String?
-  email               String       @unique
+  email               String         @unique
   emailVerified       DateTime?
   image               String?
   password            String
@@ -62,22 +83,28 @@ model User {
   qaReports           QAReport[]
   comments            Comment[]
   attachments         Attachment[]
-  createdAt           DateTime     @default(now())
-  sites               Site[]       @relation("SiteMembers") // ⬅️ same relation name
-  activities          Activity[]   @relation("activities") // activities **for this user**
-  performedActivities Activity[]   @relation("performedActivities") // activities **by this user**
+  createdAt           DateTime       @default(now())
+  sites               Site[]         @relation("SiteMembers") // ⬅️ same relation name
+  activities          Activity[]     @relation("activities") // activities **for this user**
+  performedActivities Activity[]     @relation("performedActivities") // activities **by this user**
+  siteUsers           SiteUser[]
+  teamMembers         TeamMember[]
+  status              String         @default("pending") // PENDING OR ACTIVE
+  lastActive          DateTime       @default(now())
+  notifications       Notification[]
 }
 
 model Activity {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   userId    String // The user the activity is for
   actorId   String // Who performed the action
   type      String // e.g., comment, status, assignment, completed, created
   reportId  String? // Optional, link to task
   message   String
   status    String? // Optional, e.g., "to QA" for status changes
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
   priority  String?
+  dueDate   DateTime?
 
   user   User      @relation("activities", fields: [userId], references: [id])
   actor  User      @relation("performedActivities", fields: [actorId], references: [id])
@@ -98,8 +125,9 @@ model Comment {
   updatedAt DateTime @updatedAt
 
   // 👇 SELF RELATION (this is what creates `replies`)
-  parent  Comment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
-  replies Comment[] @relation("CommentReplies")
+  parent        Comment?       @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies       Comment[]      @relation("CommentReplies")
+  notifications Notification[]
 }
 
 model Attachment {
@@ -117,6 +145,17 @@ model Attachment {
   qAReportId String?
   User       User?     @relation(fields: [userId], references: [id])
   userId     String?
+}
+
+model SiteUser {
+  userId   String
+  siteId   String
+  isPinned Boolean @default(false)
+
+  user User @relation(fields: [userId], references: [id])
+  site Site @relation(fields: [siteId], references: [id])
+
+  @@id([userId, siteId])
 }
 
 model Account {
@@ -145,6 +184,90 @@ model Session {
   expires      DateTime
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Team {
+  id               String   @id @default(cuid())
+  name             String
+  logo             String?
+  stripeCustomerId String?
+  plan             String   @default("free")
+  createdAt        DateTime @default(now())
+
+  members      TeamMember[]
+  invites      TeamInvite[]
+  sites        Site[]
+  subscription Subscription?
+}
+
+model TeamMember {
+  id   String @id @default(cuid())
+  role String @default("MEMBER") // owner | admin | member
+
+  user   User   @relation(fields: [userId], references: [id])
+  userId String
+
+  team   Team   @relation(fields: [teamId], references: [id])
+  teamId String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, teamId])
+}
+
+model TeamInvite {
+  id     String  @id @default(cuid())
+  email  String?
+  code   String  @unique
+  teamId String
+  used   Boolean @default(false)
+  role   String  @default("MEMBER")
+
+  team      Team     @relation(fields: [teamId], references: [id])
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model Subscription {
+  id     String @id @default(cuid())
+  teamId String @unique
+  team   Team   @relation(fields: [teamId], references: [id])
+
+  plan             Plan      @default(free)
+  interval         String    @default("monthly") // monthly | yearly
+  status           String    @default("active") // active | past_due | canceled
+  trialEndsAt      DateTime?
+  currentPeriodEnd DateTime?
+
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  stripePriceId        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Notification {
+  id      String           @id @default(cuid())
+  userId  String
+  type    NotificationType
+  message String
+
+  // Optional relations depending on type
+  siteId    String?
+  reportId  String?
+  commentId String?
+
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user    User      @relation(fields: [userId], references: [id])
+  site    Site?     @relation(fields: [siteId], references: [id])
+  report  QAReport? @relation(fields: [reportId], references: [id])
+  comment Comment?  @relation(fields: [commentId], references: [id])
+
+  @@index([userId, createdAt])
 }
 
 model VerificationToken {

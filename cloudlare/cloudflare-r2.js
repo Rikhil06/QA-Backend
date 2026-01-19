@@ -23,7 +23,7 @@ const getSignedR2Url = async (key) => {
       Bucket: process.env.R2_BUCKET_NAME,
       Key: key,
     }),
-    { expiresIn: 30 * 24 * 60 * 60 } // 1 month
+    { expiresIn: 7 * 24 * 60 * 60 } // 1 WEEK
   );
 };
 
