@@ -21,7 +21,8 @@ const {
 
 const app = express();
 const prisma = new PrismaClient();
-const PORT = 4000;
+const PORT = process.env.PORT || 4000;
+const ENV = process.env.NODE_ENV || 'development';
 
 require('dotenv').config();
 
@@ -55,7 +56,7 @@ app.post(
       event = stripe.webhooks.constructEvent(
         req.body,
         sig,
-        process.env.STRIPE_WEBHOOK_SECRET
+        process.env.STRIPE_WEBHOOK_SECRET,
       );
     } catch (err) {
       return res.status(400).send(`Webhook Error: ${err.message}`);
@@ -145,7 +146,7 @@ app.post(
     }
 
     res.json({ received: true });
-  }
+  },
 );
 
 app.use(cors());
@@ -159,7 +160,7 @@ const fileFilter = (req, file, cb) => {
   if (!allowed.includes(file.mimetype)) {
     return cb(
       new Error('Invalid file type. Only images and PDFs are allowed.'),
-      false
+      false,
     );
   }
 
@@ -394,7 +395,7 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
       ...dueTodayNotifications,
     ].sort(
       (a, b) =>
-        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     );
 
     res.json({
@@ -546,7 +547,7 @@ app.post('/api/auth/register', async (req, res) => {
       process.env.JWT_SECRET,
       {
         expiresIn: '7d',
-      }
+      },
     );
 
     res.status(201).json({
@@ -590,7 +591,7 @@ app.post('/api/auth/login', async (req, res) => {
       process.env.JWT_SECRET,
       {
         expiresIn: '7d',
-      }
+      },
     );
 
     res.json({
@@ -676,7 +677,7 @@ async function requireActivePlan(req, res, next) {
     // Count reports across all team sites
     const totalReports = team.sites.reduce(
       (sum, site) => sum + (site._count?.reports || 0),
-      0
+      0,
     );
 
     // Enforce report limit
@@ -818,7 +819,7 @@ app.post(
     } catch (err) {
       res.status(400).json({ error: 'Failed to create team' });
     }
-  }
+  },
 );
 
 const handleGenerateNewCode = () => {
@@ -826,8 +827,8 @@ const handleGenerateNewCode = () => {
   const segments = [4, 4, 4].map((len) =>
     Array.from(
       { length: len },
-      () => chars[Math.floor(Math.random() * chars.length)]
-    ).join('')
+      () => chars[Math.floor(Math.random() * chars.length)],
+    ).join(''),
   );
 
   return `TEAM-${segments.join('-')}`;
@@ -969,7 +970,7 @@ app.post(
     });
 
     res.json({ success: true });
-  }
+  },
 );
 
 app.post('/teams/join', authenticateToken, async (req, res) => {
@@ -1215,7 +1216,7 @@ app.post(
       console.error('Error saving report:', error);
       res.status(500).json({ error: 'Failed to save report' });
     }
-  }
+  },
 );
 
 app.get('/api/report', authenticateToken, async (req, res) => {
@@ -1293,7 +1294,7 @@ app.get('/api/report', authenticateToken, async (req, res) => {
         });
 
         return acc;
-      }, {})
+      }, {}),
     );
 
     // 👤 update activity
@@ -1951,7 +1952,7 @@ app.delete('/api/uploads', async (req, res) => {
 
     // Delete all files in the uploads directory
     await Promise.all(
-      files.map((file) => fs.promises.unlink(path.join(UPLOAD_DIR, file)))
+      files.map((file) => fs.promises.unlink(path.join(UPLOAD_DIR, file))),
     );
 
     // Optionally, also delete all entries in your database table
@@ -1986,7 +1987,7 @@ app.patch('/api/report/:id', async (req, res) => {
     if (status === 'done') {
       const resolvedAt = new Date();
       const duration = Math.round(
-        (resolvedAt.getTime() - new Date(existing.timestamp).getTime()) / 60000
+        (resolvedAt.getTime() - new Date(existing.timestamp).getTime()) / 60000,
       ); // minutes
       updates.resolvedAt = resolvedAt;
       updates.duration = duration;
@@ -2209,7 +2210,7 @@ app.get(
         .status(500)
         .json({ error: 'Failed to calculate average resolution time' });
     }
-  }
+  },
 );
 
 // PATCH /api/report/:id/due-date
@@ -2433,7 +2434,7 @@ app.post(
                 size: file.size,
                 type: file.mimetype,
               };
-            })
+            }),
           )
         : [];
 
@@ -2489,7 +2490,7 @@ app.post(
         .status(500)
         .json({ error: 'Unable to create comment with attachments' });
     }
-  }
+  },
 );
 
 // Retrieve comments with attachments for a report
@@ -2527,9 +2528,9 @@ app.get('/api/reports/:reportId/comments', async (req, res) => {
             thumbnailUrl: a.thumbnailKey
               ? await getSignedR2Url(a.thumbnailKey)
               : null,
-          }))
+          })),
         ),
-      }))
+      })),
     );
 
     res.json(withSignedUrls);
@@ -2636,7 +2637,7 @@ app.get('/api/team/:teamId/stats', authenticateToken, async (req, res) => {
     // Sum all QAReports across the team’s sites
     const screenshotsCount = teamStats.sites.reduce(
       (acc, site) => acc + site._count.reports,
-      0
+      0,
     );
 
     return res.json({
@@ -2952,7 +2953,7 @@ app.patch(
       console.error(err);
       res.status(500).json({ error: 'Failed to mark as read' });
     }
-  }
+  },
 );
 
 app.post(
@@ -2973,7 +2974,7 @@ app.post(
       console.error(err);
       res.status(500).json({ error: 'Failed to mark all as read' });
     }
-  }
+  },
 );
 
 app.use((err, req, res, next) => {
@@ -2989,5 +2990,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`QA backend running at http://localhost:${PORT}`);
+  console.log(`QA backend running in ${ENV} mode on port ${PORT}`);
 });
