@@ -151,10 +151,19 @@ app.post(
 
 app.use(
   cors({
-    origin: process.env.APP_URL,
-    credentials: true, // if you want cookies or auth headers
+    origin: function (origin, callback) {
+      // Allow requests with no Origin (like chrome extensions, mobile apps, curl)
+      if (!origin) return callback(null, true);
+
+      // Reflect requesting origin
+      return callback(null, origin);
+    },
+    credentials: true,
   }),
 );
+
+// Ensure preflight works for all routes
+app.options('*', cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
