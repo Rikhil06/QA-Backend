@@ -2996,4 +2996,5 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`QA backend running in ${ENV} mode on port ${PORT}`);
+  console.log('DATABASE_URL:', process.env.DATABASE_URL);
 });
