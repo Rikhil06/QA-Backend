@@ -22,19 +22,29 @@ enum NotificationType {
 }
 
 model Site {
-  id            String         @id @default(cuid())
-  name          String
-  url           String
-  domain        String         @unique
-  slug          String
-  archived      Boolean        @default(false)
-  reports       QAReport[]
-  users         User[]         @relation("SiteMembers") // ⬅️ relation name
-  createdAt     DateTime       @default(now())
-  siteUsers     SiteUser[]
-  team          Team?          @relation(fields: [teamId], references: [id])
-  teamId        String?
-  notifications Notification[]
+  id             String          @id @default(cuid())
+  name           String
+  url            String
+  domain         String          @unique
+  slug           String
+  archived       Boolean         @default(false)
+  reports        QAReport[]
+  users          User[]          @relation("SiteMembers") // ⬅️ relation name
+  createdAt      DateTime        @default(now())
+  siteUsers      SiteUser[]
+  team           Team?           @relation(fields: [teamId], references: [id])
+  teamId         String?
+  notifications  Notification[]
+  kanbanColumns  KanbanColumn[]
+  columnOrder    String[]        @default([])
+}
+
+model KanbanColumn {
+  id        String   @id @default(cuid())
+  name      String
+  siteId    String
+  site      Site     @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
 }
 
 model QAReport {
@@ -91,6 +101,7 @@ model User {
   teamMembers         TeamMember[]
   status              String         @default("pending") // PENDING OR ACTIVE
   lastActive          DateTime       @default(now())
+  notificationPrefs   Json?
   notifications       Notification[]
 }
 

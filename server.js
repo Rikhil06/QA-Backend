@@ -1,4 +1,6 @@
 const express = require('express');
+const http = require('http');
+const { Server: SocketIOServer } = require('socket.io');
 const { PrismaClient } = require('@prisma/client');
 const multer = require('multer');
 const path = require('path');
@@ -20,6 +22,15 @@ const {
 } = require('./cloudlare/cloudflare-r2');
 
 const app = express();
+const httpServer = http.createServer(app);
+const io = new SocketIOServer(httpServer, {
+  cors: {
+    origin: function (origin, callback) {
+      return callback(null, origin || '*');
+    },
+    credentials: true,
+  },
+});
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 4000;
 const ENV = process.env.NODE_ENV || 'development';
@@ -1116,7 +1127,7 @@ app.post(
   requireActivePlan,
   uploadAttachments.single('screenshot'),
   async (req, res) => {
-    const { url, comment, x, y, title, priority, type, dueDate, teamId } =
+    const { url, comment, x, y, title, priority, type, dueDate, teamId, pageTitle, browser, os, screenSize } =
       req.body;
     const file = req.file;
 
@@ -1171,6 +1182,10 @@ app.post(
           slug,
           siteName,
           title,
+          pageTitle,
+          browser,
+          os,
+          screenSize,
           priority,
           type,
           dueDate: dueDate ? new Date(dueDate) : null,
@@ -1944,6 +1959,149 @@ app.patch('/api/site/:slug/archive', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/site/:slug/columns — return custom kanban columns for a site
+app.get('/api/site/:slug/columns', authenticateToken, async (req, res) => {
+  const { slug } = req.params;
+  const { teamId } = req.query;
+
+  if (!teamId) {
+    return res.status(400).json({ error: 'teamId is required' });
+  }
+
+  try {
+    const site = await prisma.site.findFirst({ where: { slug, teamId } });
+    if (!site) return res.status(404).json({ error: 'Site not found' });
+
+    const columns = await prisma.kanbanColumn.findMany({
+      where: { siteId: site.id },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true, name: true },
+    });
+
+    res.json(columns.map((col) => ({ ...col, slug })));
+  } catch (error) {
+    console.error('Failed to fetch columns:', error);
+    res.status(500).json({ error: 'Failed to fetch columns' });
+  }
+});
+
+// POST /api/site/:slug/columns — create a custom kanban column
+app.post('/api/site/:slug/columns', authenticateToken, async (req, res) => {
+  const { slug } = req.params;
+  const { name, teamId } = req.body;
+
+  if (!name || !name.trim()) {
+    return res.status(400).json({ error: 'name is required' });
+  }
+  if (!teamId) {
+    return res.status(400).json({ error: 'teamId is required' });
+  }
+
+  try {
+    const site = await prisma.site.findFirst({ where: { slug, teamId } });
+    if (!site) return res.status(404).json({ error: 'Site not found' });
+
+    const column = await prisma.kanbanColumn.create({
+      data: { name: name.trim(), siteId: site.id },
+      select: { id: true, name: true },
+    });
+
+    io.to(`site:${slug}`).emit('board:event', { type: 'column:created', column: { ...column, slug } });
+    res.status(201).json({ ...column, slug });
+  } catch (error) {
+    console.error('Failed to create column:', error);
+    res.status(500).json({ error: 'Failed to create column' });
+  }
+});
+
+// DELETE /api/site/:slug/columns/:columnId — delete a custom kanban column (only if empty)
+app.delete('/api/site/:slug/columns/:columnId', authenticateToken, async (req, res) => {
+  const { slug, columnId } = req.params;
+  const { teamId } = req.query;
+
+  if (!teamId) {
+    return res.status(400).json({ error: 'teamId is required' });
+  }
+
+  try {
+    const site = await prisma.site.findFirst({ where: { slug, teamId } });
+    if (!site) return res.status(404).json({ error: 'Site not found' });
+
+    const column = await prisma.kanbanColumn.findFirst({
+      where: { id: columnId, siteId: site.id },
+    });
+    if (!column) return res.status(404).json({ error: 'Column not found' });
+
+    const reportCount = await prisma.qAReport.count({
+      where: { siteId: site.id, status: column.name },
+    });
+
+    if (reportCount > 0) {
+      return res.status(409).json({ error: 'Column still has reports' });
+    }
+
+    await prisma.kanbanColumn.delete({ where: { id: columnId } });
+
+    io.to(`site:${slug}`).emit('board:event', { type: 'column:deleted', columnId });
+    res.json({ message: 'Column deleted' });
+  } catch (error) {
+    console.error('Failed to delete column:', error);
+    res.status(500).json({ error: 'Failed to delete column' });
+  }
+});
+
+// GET /api/site/:slug/columns/order — return saved column order for a site
+app.get('/api/site/:slug/columns/order', authenticateToken, async (req, res) => {
+  const { slug } = req.params;
+  const { teamId } = req.query;
+
+  if (!teamId) {
+    return res.status(400).json({ error: 'teamId is required' });
+  }
+
+  try {
+    const site = await prisma.site.findFirst({
+      where: { slug, teamId },
+      select: { columnOrder: true },
+    });
+    if (!site) return res.status(404).json({ error: 'Site not found' });
+
+    res.json({ order: site.columnOrder });
+  } catch (error) {
+    console.error('Failed to fetch column order:', error);
+    res.status(500).json({ error: 'Failed to fetch column order' });
+  }
+});
+
+// PATCH /api/site/:slug/columns/reorder — persist column order
+app.patch('/api/site/:slug/columns/reorder', authenticateToken, async (req, res) => {
+  const { slug } = req.params;
+  const { order, teamId } = req.body;
+
+  if (!teamId) {
+    return res.status(400).json({ error: 'teamId is required' });
+  }
+  if (!Array.isArray(order)) {
+    return res.status(400).json({ error: 'order must be an array' });
+  }
+
+  try {
+    const site = await prisma.site.findFirst({ where: { slug, teamId } });
+    if (!site) return res.status(404).json({ error: 'Site not found' });
+
+    await prisma.site.update({
+      where: { id: site.id },
+      data: { columnOrder: order },
+    });
+
+    io.to(`site:${slug}`).emit('board:event', { type: 'column:reordered', order });
+    res.json({ order });
+  } catch (error) {
+    console.error('Failed to save column order:', error);
+    res.status(500).json({ error: 'Failed to save column order' });
+  }
+});
+
 app.get('/uploads', authenticateToken, async (req, res) => {
   const userId = req.user.id;
   try {
@@ -2290,6 +2448,7 @@ app.patch('/api/report/:id/status', authenticateToken, async (req, res) => {
     const updated = await prisma.qAReport.update({
       where: { id },
       data: { status },
+      include: { Site: { select: { slug: true } } },
     });
 
     if (updated.userId !== req.user.id) {
@@ -2307,6 +2466,10 @@ app.patch('/api/report/:id/status', authenticateToken, async (req, res) => {
       where: { id: req.user.id },
       data: { lastActive: new Date() },
     });
+
+    if (updated.Site?.slug) {
+      io.to(`site:${updated.Site.slug}`).emit('board:event', { type: 'report:status', reportId: id, status });
+    }
 
     res.json(updated);
   } catch (error) {
@@ -2846,6 +3009,8 @@ app.get('/api/invoices', authenticateToken, async (req, res) => {
       subscription: inv.subscription,
     }));
 
+    console.log(formattedInvoices);
+
     res.json(formattedInvoices);
   } catch (error) {
     console.error('Error fetching invoices:', error);
@@ -2991,6 +3156,319 @@ app.post(
   },
 );
 
+// ─── Password Reset ──────────────────────────────────────────────────────────
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  // Always respond success to prevent email enumeration
+  res.json({ message: 'If that email is registered you will receive a reset link.' });
+
+  if (!email) return;
+
+  try {
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return;
+
+    const crypto = require('crypto');
+    const token = crypto.randomBytes(32).toString('hex');
+    const expires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    await prisma.verificationToken.upsert({
+      where: { token },
+      update: { expires },
+      create: { identifier: email, token, expires },
+    });
+
+    const resetUrl = `${process.env.APP_URL}/reset-password?token=${token}`;
+
+    if (!resend) return;
+    await resend.emails.send({
+      from: process.env.EMAIL_FROM || 'noreply@yourdomain.com',
+      to: email,
+      subject: 'Reset your password',
+      html: `<p>Click the link below to reset your password. It expires in 1 hour.</p>
+             <p><a href="${resetUrl}">${resetUrl}</a></p>
+             <p>If you didn't request this, you can ignore this email.</p>`,
+    });
+  } catch (err) {
+    console.error('forgot-password error:', err);
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { token, password } = req.body;
+  if (!token || !password) {
+    return res.status(400).json({ error: 'token and password are required' });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  }
+
+  try {
+    const record = await prisma.verificationToken.findUnique({ where: { token } });
+    if (!record || record.expires < new Date()) {
+      return res.status(400).json({ error: 'Invalid or expired reset token' });
+    }
+
+    const hashed = await bcrypt.hash(password, 10);
+    await prisma.user.update({
+      where: { email: record.identifier },
+      data: { password: hashed },
+    });
+
+    await prisma.verificationToken.delete({ where: { token } });
+
+    res.json({ message: 'Password updated successfully' });
+  } catch (err) {
+    console.error('reset-password error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ─── OAuth (Google & GitHub) ──────────────────────────────────────────────────
+
+app.get('/api/auth/google', (req, res) => {
+  const params = new URLSearchParams({
+    client_id: process.env.GOOGLE_CLIENT_ID,
+    redirect_uri: `${process.env.BACKEND_URL || `http://localhost:${PORT}`}/api/auth/google/callback`,
+    response_type: 'code',
+    scope: 'openid email profile',
+    access_type: 'offline',
+    prompt: 'select_account',
+  });
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`);
+});
+
+app.get('/api/auth/google/callback', async (req, res) => {
+  const { code, error } = req.query;
+  const frontendUrl = process.env.APP_URL || 'http://localhost:3000';
+
+  if (error || !code) {
+    return res.redirect(`${frontendUrl}/callback?error=oauth_cancelled`);
+  }
+
+  try {
+    const redirectUri = `${process.env.BACKEND_URL || `http://localhost:${PORT}`}/api/auth/google/callback`;
+
+    const tokenRes = await axios.post('https://oauth2.googleapis.com/token', {
+      code,
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code',
+    });
+
+    const profileRes = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${tokenRes.data.access_token}` },
+    });
+
+    const { email, name, sub: providerAccountId } = profileRes.data;
+
+    let user = await prisma.user.findUnique({ where: { email } });
+    if (!user) {
+      user = await prisma.user.create({
+        data: { email, name, password: '', status: 'active' },
+      });
+    }
+
+    await prisma.account.upsert({
+      where: { provider_providerAccountId: { provider: 'google', providerAccountId } },
+      update: { access_token: tokenRes.data.access_token },
+      create: { userId: user.id, type: 'oauth', provider: 'google', providerAccountId, access_token: tokenRes.data.access_token },
+    });
+
+    const memberships = await prisma.teamMember.findMany({
+      where: { userId: user.id },
+      select: { teamId: true, role: true },
+    });
+
+    const jwtToken = jwt.sign(
+      { id: user.id, email: user.email, name: user.name, teams: memberships },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' },
+    );
+
+    res.redirect(`${frontendUrl}/callback?token=${jwtToken}`);
+  } catch (err) {
+    console.error('Google OAuth error:', err?.response?.data || err.message);
+    res.redirect(`${process.env.APP_URL || 'http://localhost:3000'}/callback?error=oauth_failed`);
+  }
+});
+
+app.get('/api/auth/github', (req, res) => {
+  const params = new URLSearchParams({
+    client_id: process.env.GITHUB_CLIENT_ID,
+    redirect_uri: `${process.env.BACKEND_URL || `http://localhost:${PORT}`}/api/auth/github/callback`,
+    scope: 'user:email',
+  });
+  res.redirect(`https://github.com/login/oauth/authorize?${params}`);
+});
+
+app.get('/api/auth/github/callback', async (req, res) => {
+  const { code, error } = req.query;
+  const frontendUrl = process.env.APP_URL || 'http://localhost:3000';
+
+  if (error || !code) {
+    return res.redirect(`${frontendUrl}/callback?error=oauth_cancelled`);
+  }
+
+  try {
+    const tokenRes = await axios.post(
+      'https://github.com/login/oauth/access_token',
+      {
+        client_id: process.env.GITHUB_CLIENT_ID,
+        client_secret: process.env.GITHUB_CLIENT_SECRET,
+        code,
+        redirect_uri: `${process.env.BACKEND_URL || `http://localhost:${PORT}`}/api/auth/github/callback`,
+      },
+      { headers: { Accept: 'application/json' } },
+    );
+
+    const accessToken = tokenRes.data.access_token;
+
+    const [profileRes, emailsRes] = await Promise.all([
+      axios.get('https://api.github.com/user', { headers: { Authorization: `Bearer ${accessToken}` } }),
+      axios.get('https://api.github.com/user/emails', { headers: { Authorization: `Bearer ${accessToken}` } }),
+    ]);
+
+    const primaryEmail = emailsRes.data.find((e) => e.primary && e.verified)?.email;
+    const email = primaryEmail || profileRes.data.email;
+    const name = profileRes.data.name || profileRes.data.login;
+    const providerAccountId = String(profileRes.data.id);
+
+    if (!email) {
+      return res.redirect(`${frontendUrl}/callback?error=no_email`);
+    }
+
+    let user = await prisma.user.findUnique({ where: { email } });
+    if (!user) {
+      user = await prisma.user.create({
+        data: { email, name, password: '', status: 'active' },
+      });
+    }
+
+    await prisma.account.upsert({
+      where: { provider_providerAccountId: { provider: 'github', providerAccountId } },
+      update: { access_token: accessToken },
+      create: { userId: user.id, type: 'oauth', provider: 'github', providerAccountId, access_token: accessToken },
+    });
+
+    const memberships = await prisma.teamMember.findMany({
+      where: { userId: user.id },
+      select: { teamId: true, role: true },
+    });
+
+    const jwtToken = jwt.sign(
+      { id: user.id, email: user.email, name: user.name, teams: memberships },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' },
+    );
+
+    res.redirect(`${frontendUrl}/callback?token=${jwtToken}`);
+  } catch (err) {
+    console.error('GitHub OAuth error:', err?.response?.data || err.message);
+    res.redirect(`${process.env.APP_URL || 'http://localhost:3000'}/callback?error=oauth_failed`);
+  }
+});
+
+// ─── Settings ─────────────────────────────────────────────────────────────────
+
+// PATCH /api/users/me — update name and/or email
+app.patch('/api/users/me', authenticateToken, async (req, res) => {
+  const { name, email } = req.body;
+  const data = {};
+  if (name !== undefined) data.name = name;
+  if (email !== undefined) data.email = email;
+
+  if (Object.keys(data).length === 0) {
+    return res.status(400).json({ error: 'No fields to update' });
+  }
+
+  try {
+    if (email) {
+      const existing = await prisma.user.findFirst({
+        where: { email, NOT: { id: req.user.id } },
+      });
+      if (existing) return res.status(409).json({ error: 'Email already in use' });
+    }
+
+    const user = await prisma.user.update({
+      where: { id: req.user.id },
+      data,
+      select: { id: true, name: true, email: true },
+    });
+
+    res.json({ user });
+  } catch (err) {
+    console.error('PATCH /api/users/me error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/auth/change-password
+app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ error: 'currentPassword and newPassword are required' });
+  }
+  if (newPassword.length < 8) {
+    return res.status(400).json({ error: 'New password must be at least 8 characters' });
+  }
+
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    if (!user || !user.password) {
+      return res.status(400).json({ error: 'Cannot change password for OAuth accounts' });
+    }
+
+    const valid = await bcrypt.compare(currentPassword, user.password);
+    if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
+
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await prisma.user.update({ where: { id: req.user.id }, data: { password: hashed } });
+
+    res.json({ message: 'Password updated successfully' });
+  } catch (err) {
+    console.error('change-password error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// PATCH /api/users/me/notifications — update notification preferences
+app.patch('/api/users/me/notifications', authenticateToken, async (req, res) => {
+  const { taskAssigned, overdue, dueToday, teamInvite } = req.body;
+  const prefs = { taskAssigned, overdue, dueToday, teamInvite };
+
+  try {
+    const user = await prisma.user.update({
+      where: { id: req.user.id },
+      data: { notificationPrefs: prefs },
+      select: { id: true, notificationPrefs: true },
+    });
+
+    res.json({ notificationPrefs: user.notificationPrefs });
+  } catch (err) {
+    console.error('PATCH /api/users/me/notifications error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE /api/users/me — delete account (requires email confirmation)
+app.delete('/api/users/me', authenticateToken, async (req, res) => {
+  const { email } = req.body;
+  if (!email || email !== req.user.email) {
+    return res.status(400).json({ error: 'Email confirmation does not match' });
+  }
+
+  try {
+    await prisma.user.delete({ where: { id: req.user.id } });
+    res.json({ message: 'Account deleted' });
+  } catch (err) {
+    console.error('DELETE /api/users/me error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     return res.status(400).json({ error: err.message });
@@ -3003,7 +3481,28 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-app.listen(PORT, () => {
+// Socket.io — authenticate via JWT handshake, join site rooms
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next(new Error('Unauthorized'));
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return next(new Error('Unauthorized'));
+    socket.user = user;
+    next();
+  });
+});
+
+io.on('connection', (socket) => {
+  // Client sends { slug } to join the site room
+  socket.on('join:site', (slug) => {
+    if (typeof slug === 'string') socket.join(`site:${slug}`);
+  });
+  socket.on('leave:site', (slug) => {
+    if (typeof slug === 'string') socket.leave(`site:${slug}`);
+  });
+});
+
+httpServer.listen(PORT, () => {
   console.log(`QA backend running in ${ENV} mode on port ${PORT}`);
   console.log('DATABASE_URL:', process.env.DATABASE_URL);
 });
