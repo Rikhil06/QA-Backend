@@ -68,6 +68,11 @@ model QAReport {
   userName   String
   dueDate    DateTime?
 
+  pageTitle  String?
+  browser    String?
+  os         String?
+  screenSize String?
+
   archived   Boolean   @default(false)
   archivedAt DateTime?
 
