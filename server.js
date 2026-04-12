@@ -1134,20 +1134,7 @@ app.post(
     if (!file) return res.status(400).json({ error: 'No screenshot uploaded' });
 
     const domain = new URL(url).hostname.replace('www.', '');
-
-    // Fetch site name from the page (fallback to domain)
-    let siteName = '';
-    try {
-      const response = await axios.get(url);
-      const $ = cheerio.load(response.data);
-      siteName =
-        $('meta[property="og:site_name"]').attr('content') ||
-        $('title').text().trim() ||
-        domain;
-    } catch (err) {
-      console.warn(`Failed to fetch site name from ${url}:`, err.message);
-      siteName = domain;
-    }
+    const siteName = pageTitle || domain;
 
     try {
       // Make sure user exists
