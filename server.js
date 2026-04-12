@@ -571,7 +571,7 @@ app.post('/api/auth/register', async (req, res) => {
       },
       process.env.JWT_SECRET,
       {
-        expiresIn: '7d',
+        expiresIn: '30d',
       },
     );
 
@@ -615,7 +615,7 @@ app.post('/api/auth/login', async (req, res) => {
       },
       process.env.JWT_SECRET,
       {
-        expiresIn: '7d',
+        expiresIn: '30d',
       },
     );
 
@@ -1238,6 +1238,12 @@ app.post(
       await prisma.user.update({
         where: { id: req.user.id },
         data: { lastActive: new Date() },
+      });
+
+      // Notify all clients viewing this site's board in real time
+      io.to(`site:${slug}`).emit('board:event', {
+        type: 'report:created',
+        reportId: report.id,
       });
 
       res.json(report);
@@ -3493,12 +3499,17 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
-  // Client sends { slug } to join the site room
-  socket.on('join:site', (slug) => {
-    if (typeof slug === 'string') socket.join(`site:${slug}`);
+  // Client sends either a string slug or { slug } object
+  const resolveSlug = (payload) =>
+    typeof payload === 'string' ? payload : payload?.slug;
+
+  socket.on('join:site', (payload) => {
+    const slug = resolveSlug(payload);
+    if (slug) socket.join(`site:${slug}`);
   });
-  socket.on('leave:site', (slug) => {
-    if (typeof slug === 'string') socket.leave(`site:${slug}`);
+  socket.on('leave:site', (payload) => {
+    const slug = resolveSlug(payload);
+    if (slug) socket.leave(`site:${slug}`);
   });
 });
 
