@@ -282,20 +282,32 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || process.env.APP_URL || '
   .split(',')
   .map((o) => o.trim());
 
-app.use(
-  cors({
+// The QA extension is injected into arbitrary third-party customer sites (the page whose
+// bugs are being reported), so its origin can never be known ahead of time. Its requests are
+// bearer-token authenticated (not cookie-based), so reflecting any origin here doesn't expose
+// the dashboard to CSRF — a malicious page can't read the extension's stored token. The
+// dashboard app itself still goes through the strict allowlist below.
+const EXTENSION_ROUTES = ['/api/teams', '/api/report'];
+
+function corsForRequest(req, res, next) {
+  if (EXTENSION_ROUTES.includes(req.path)) {
+    return cors({ origin: true, credentials: false })(req, res, next);
+  }
+  return cors({
     origin: function (origin, callback) {
-      // Allow no-origin requests (Chrome extensions, mobile apps, curl)
+      // Allow no-origin requests (mobile apps, curl)
       if (!origin) return callback(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
       return callback(new Error(`CORS: origin ${origin} not allowed`));
     },
     credentials: true,
-  }),
-);
+  })(req, res, next);
+}
+
+app.use(corsForRequest);
 
 // Ensure preflight works for all routes
-app.options('*', cors());
+app.options('*', corsForRequest);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Health check — used by Render, uptime monitors, load balancers
