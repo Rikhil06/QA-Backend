@@ -29,6 +29,9 @@ async function getOwnerTeams(userId) {
       id: true,
       email: true,
       name: true,
+      emailVerified: true,
+      notificationPrefs: true,
+      lastSeenNotificationsAt: true,
       teamMembers: {
         where: { role: 'owner' },
         select: {
@@ -63,6 +66,9 @@ async function getMemberTeams(userId) {
       id: true,
       email: true,
       name: true,
+      emailVerified: true,
+      notificationPrefs: true,
+      lastSeenNotificationsAt: true,
       teamMembers: {
         where: { role: 'member' },
         select: {

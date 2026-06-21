@@ -1,3 +1,33 @@
+// ── Load .env before anything else ──────────────────────────────────────────
+require('dotenv').config();
+
+// ── Validate required environment variables ──────────────────────────────────
+const REQUIRED_ENV = ['JWT_SECRET', 'DATABASE_URL'];
+const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
+if (missing.length) {
+  console.error(`[startup] Missing required environment variables: ${missing.join(', ')}`);
+  process.exit(1);
+}
+
+// ── Sentry must be initialised before everything else ──────────────────────
+const Sentry = require('@sentry/node');
+
+Sentry.init({
+  dsn: process.env.SENTRY_DSN,
+  environment: process.env.NODE_ENV || 'development',
+  tracesSampleRate: process.env.NODE_ENV === 'production' ? 0.1 : 1.0,
+  enabled: process.env.NODE_ENV === 'production' || !!process.env.SENTRY_DSN,
+  integrations: [Sentry.prismaIntegration()],
+  beforeSend(event) {
+    // Strip Authorization headers from Sentry payloads
+    if (event.request?.headers) {
+      delete event.request.headers['authorization'];
+      delete event.request.headers['cookie'];
+    }
+    return event;
+  },
+});
+
 const express = require('express');
 const http = require('http');
 const { Server: SocketIOServer } = require('socket.io');
@@ -8,12 +38,51 @@ const fs = require('fs');
 const cors = require('cors');
 const axios = require('axios');
 const { Resend } = require('resend');
-const cheerio = require('cheerio');
+const morgan = require('morgan');
+// cheerio removed — was unused
 const slugify = require('slugify');
 const jwt = require('jsonwebtoken');
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const { getUserTeams } = require('./services/userTeams.service');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
+const NodeCache = require('node-cache');
+const helmet = require('helmet');
+const compression = require('compression');
+
+// ── Error logging helper ────────────────────────────────────────────────────
+// Drop-in replacement for console.error that also forwards to Sentry.
+// Accepts the same variadic args as console.error so every call site can be
+// swapped with a find-and-replace without changing argument structure.
+function captureError(...args) {
+  console.error(...args);
+  // Find the first real Error (or error-like object) in the arguments
+  const err =
+    args.find((a) => a instanceof Error) ||
+    args.find((a) => a && typeof a === 'object' && a.message);
+  const label = typeof args[0] === 'string' ? args[0] : undefined;
+  if (err) {
+    Sentry.captureException(err instanceof Error ? err : new Error(String(err)), {
+      extra: label ? { label } : undefined,
+    });
+  } else {
+    // No Error object — capture as a message so it still surfaces in Sentry
+    Sentry.captureMessage(args.map(String).join(' '), 'error');
+  }
+}
+
+// Catch anything that slipped through unhandled
+process.on('uncaughtException', (err) => {
+  captureError('uncaughtException', err);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  captureError(
+    'unhandledRejection',
+    reason instanceof Error ? reason : new Error(String(reason))
+  );
+});
 
 const {
   uploadBufferToR2,
@@ -26,7 +95,11 @@ const httpServer = http.createServer(app);
 const io = new SocketIOServer(httpServer, {
   cors: {
     origin: function (origin, callback) {
-      return callback(null, origin || '*');
+      if (!origin) return callback(null, true); // same-origin / mobile
+      const allowed = (process.env.ALLOWED_ORIGINS || process.env.APP_URL || 'http://localhost:3000')
+        .split(',').map((o) => o.trim());
+      if (allowed.includes(origin)) return callback(null, true);
+      return callback(new Error(`Socket CORS: origin ${origin} not allowed`));
     },
     credentials: true,
   },
@@ -35,7 +108,10 @@ const prisma = new PrismaClient();
 const PORT = process.env.PORT || 4000;
 const ENV = process.env.NODE_ENV || 'development';
 
-require('dotenv').config();
+async function getStripeAccountEmail() {
+  const account = await stripe.accounts.retrieve();
+  return account.email;
+}
 
 function mapPriceToPlan(priceId) {
   switch (priceId) {
@@ -56,6 +132,11 @@ function mapPriceToPlan(priceId) {
   }
 }
 
+app.get('/stripe/account', authenticateToken, async (req, res) => {
+  const email = await getStripeAccountEmail();
+  res.json({ email });
+});
+
 app.post(
   '/billing/webhook',
   express.raw({ type: 'application/json' }),
@@ -75,23 +156,36 @@ app.post(
 
     const obj = event.data.object;
 
-    const teamId = obj?.metadata?.teamId;
+    // teamId is on checkout session metadata — NOT on subscription/invoice objects.
+    // For subscription lifecycle events, look up the team via Stripe customer ID.
+    const metaTeamId = obj?.metadata?.teamId;
+    const stripeCustomerId = obj?.customer ?? obj?.data?.object?.customer;
+
+    let teamId = metaTeamId;
+    if (!teamId && stripeCustomerId) {
+      const team = await prisma.team.findFirst({
+        where: { stripeCustomerId },
+        select: { id: true },
+      });
+      teamId = team?.id ?? null;
+    }
 
     switch (event.type) {
       case 'checkout.session.completed': {
         if (!obj.subscription) break;
 
         const sub = await stripe.subscriptions.retrieve(obj.subscription);
+        const checkoutPlan = mapPriceToPlan(sub.items.data[0].price.id);
 
         await prisma.subscription.upsert({
           where: { teamId },
           update: {
-            plan: mapPriceToPlan(sub.items.data[0].price.id),
+            plan: checkoutPlan,
             interval: sub.items.data[0].price.recurring.interval,
             status: sub.status,
             stripeCustomerId: sub.customer,
             stripeSubscriptionId: sub.id,
-            stripePriceId: sub.items.data[0].id,
+            stripePriceId: sub.items.data[0].price.id,
             currentPeriodEnd: sub.current_period_end
               ? new Date(sub.current_period_end * 1000)
               : null,
@@ -99,30 +193,33 @@ app.post(
           },
           create: {
             teamId,
-            plan: mapPriceToPlan(sub.items.data[0].price.id),
+            plan: checkoutPlan,
             interval: sub.items.data[0].price.recurring.interval,
             status: sub.status,
             stripeCustomerId: sub.customer,
             stripeSubscriptionId: sub.id,
-            stripePriceId: sub.items.data[0].id,
+            stripePriceId: sub.items.data[0].price.id,
             currentPeriodEnd: sub.current_period_end
               ? new Date(sub.current_period_end * 1000)
               : null,
           },
         });
+        if (teamId) await prisma.team.update({ where: { id: teamId }, data: { plan: checkoutPlan } });
 
         break;
       }
 
       case 'customer.subscription.created':
       case 'customer.subscription.updated': {
+        if (!teamId) break;
+        const subPlan = mapPriceToPlan(obj.items.data[0].price.id);
         await prisma.subscription.upsert({
           where: { teamId },
           update: {
-            plan: mapPriceToPlan(obj.items.data[0].price.id),
+            plan: subPlan,
             interval: obj.items.data[0].price.recurring.interval,
             status: obj.status,
-            stripePriceId: obj.items.data[0].id,
+            stripePriceId: obj.items.data[0].price.id,
             currentPeriodEnd: obj.current_period_end
               ? new Date(obj.current_period_end * 1000)
               : null,
@@ -130,28 +227,29 @@ app.post(
           },
           create: {
             teamId,
-            plan: mapPriceToPlan(obj.items.data[0].price.id),
+            plan: subPlan,
             interval: obj.items.data[0].price.recurring.interval,
             status: obj.status,
             stripeSubscriptionId: obj.id,
-            stripePriceId: obj.items.data[0].id,
+            stripePriceId: obj.items.data[0].price.id,
             currentPeriodEnd: obj.current_period_end
               ? new Date(obj.current_period_end * 1000)
               : null,
           },
         });
+        await prisma.team.update({ where: { id: teamId }, data: { plan: subPlan } });
 
         break;
       }
 
       case 'customer.subscription.deleted': {
-        await prisma.subscription.update({
-          where: { teamId },
-          data: {
-            status: 'canceled',
-            plan: 'FREE',
-          },
-        });
+        if (teamId) {
+          await prisma.subscription.update({
+            where: { teamId },
+            data: { status: 'canceled', plan: 'free' },
+          });
+          await prisma.team.update({ where: { id: teamId }, data: { plan: 'free' } });
+        }
         break;
       }
     }
@@ -160,14 +258,37 @@ app.post(
   },
 );
 
+// Sentry v8+ auto-instruments Express — no request handler middleware needed.
+
+// Trust the first proxy (Render, Vercel, etc.) so rate limiters see real IPs
+app.set('trust proxy', 1);
+
+// Security headers
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' }, // allow images from R2
+  contentSecurityPolicy: false, // handled by the frontend
+}));
+
+// Gzip all responses
+app.use(compression());
+
+// HTTP request logging — skip health checks to avoid noise
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev', {
+  skip: (req) => req.path === '/health',
+}));
+
+// Strict CORS — only allow known frontend origins
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || process.env.APP_URL || 'http://localhost:3000')
+  .split(',')
+  .map((o) => o.trim());
+
 app.use(
   cors({
     origin: function (origin, callback) {
-      // Allow requests with no Origin (like chrome extensions, mobile apps, curl)
+      // Allow no-origin requests (Chrome extensions, mobile apps, curl)
       if (!origin) return callback(null, true);
-
-      // Reflect requesting origin
-      return callback(null, origin);
+      if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+      return callback(new Error(`CORS: origin ${origin} not allowed`));
     },
     credentials: true,
   }),
@@ -177,7 +298,129 @@ app.use(
 app.options('*', cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// Health check — used by Render, uptime monitors, load balancers
+app.get('/health', async (req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ status: 'ok', db: 'ok', ts: new Date().toISOString() });
+  } catch {
+    res.status(503).json({ status: 'error', db: 'unreachable', ts: new Date().toISOString() });
+  }
+});
+
+// ── Rate Limiters ───────────────────────────────────────────────────────────
+
+// Strict limiter for public auth endpoints (brute-force protection)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts, please try again in 15 minutes' },
+});
+
+// Per-user upload limiter (placed after authenticateToken so req.user is set)
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.id || ipKeyGenerator(req),
+  message: { error: 'Upload limit reached, please try again later' },
+});
+
+// Search limiter — short window to prevent scraping
+const searchLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many search requests, please slow down' },
+});
+
+// General API guard — broad safety net for all /api/* routes
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 1500,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later' },
+  skip: (req) => req.path === '/billing/webhook', // never rate-limit Stripe webhooks
+});
+
+app.use('/api', apiLimiter);
+
+// ── In-memory Cache ─────────────────────────────────────────────────────────
+
+const appCache = new NodeCache({ checkperiod: 60, useClones: false });
+
+const TTL = {
+  STATS:   5 * 60,   // 5 minutes  — dashboard counters
+  SITES:   2 * 60,   // 2 minutes  — sites list
+  COLUMNS: 10 * 60,  // 10 minutes — kanban column config
+  SEARCH:  30,       // 30 seconds — search results
+};
+
+// Cache middleware factory — wraps res.json to store + serve cached responses
+function cacheMiddleware(keyFn, ttl) {
+  return (req, res, next) => {
+    const key = keyFn(req);
+    const cached = appCache.get(key);
+    if (cached !== undefined) {
+      return res.json(cached);
+    }
+    const originalJson = res.json.bind(res);
+    res.json = (data) => {
+      if (res.statusCode < 400) appCache.set(key, data, ttl);
+      return originalJson(data);
+    };
+    next();
+  };
+}
+
+// Invalidation helpers — called after any mutation that changes these datasets
+function invalidateUserStats(userId) {
+  ['open', 'inprogress', 'resolved', 'summary', 'weekly', 'avgresolution'].forEach(
+    (k) => appCache.del(`stats:${k}:${userId}`)
+  );
+}
+function invalidateUserSites(userId) {
+  appCache.del(`sites:${userId}`);
+}
+function invalidateSiteColumns(slug) {
+  appCache.del(`columns:${slug}`);
+}
+
+/**
+ * Find a site the user is allowed to read.
+ * Works for both team members (ownership via teamId) and board guests (BoardAccess).
+ * The `slugOrDomain` param can be the DB slug field OR the domain field — we try both.
+ */
+async function resolveSiteForUser(slugOrDomain, teamId, userId) {
+  // 1. Team-owner path: match by (slug OR domain) + teamId, but only if the
+  // requester is actually a member of that team — otherwise a client could
+  // pass an arbitrary teamId belonging to a site they have no access to.
+  if (teamId && teamId !== 'null' && teamId !== 'undefined') {
+    const membership = await prisma.teamMember.findFirst({ where: { teamId, userId } });
+    if (membership) {
+      const site = await prisma.site.findFirst({
+        where: { OR: [{ slug: slugOrDomain, teamId }, { domain: slugOrDomain, teamId }] },
+      });
+      if (site) return site;
+    }
+  }
+
+  // 2. Guest path: find the site by slug or domain, then verify BoardAccess
+  const site = await prisma.site.findFirst({
+    where: { OR: [{ slug: slugOrDomain }, { domain: slugOrDomain }] },
+  });
+  if (!site) return null;
+
+  const access = await prisma.boardAccess.findUnique({
+    where: { siteId_userId: { siteId: site.id, userId } },
+  });
+  return access ? site : null;
+}
 
 const fileFilter = (req, file, cb) => {
   const allowed = ['image/png', 'image/jpeg', 'image/webp', 'application/pdf'];
@@ -204,28 +447,63 @@ function getUserTeamIds(req) {
   return req.user?.teams?.map((t) => t.teamId) || [];
 }
 
+// Returns site domains scoped to a specific team (verifying membership) or all accessible sites.
+// Returns the report if the user owns it or is a member of its site's team. Throws 403 otherwise.
+async function assertReportAccess(reportId, userId, res) {
+  const report = await prisma.qAReport.findUnique({
+    where: { id: reportId },
+    include: { Site: { select: { teamId: true } } },
+  });
+  if (!report) { res.status(404).json({ error: 'Report not found' }); return null; }
+  const siteTeamId = report.Site?.teamId;
+  if (siteTeamId) {
+    const member = await prisma.teamMember.findFirst({ where: { teamId: siteTeamId, userId } });
+    if (member) return report;
+  }
+  if (report.userId === userId) return report;
+  res.status(403).json({ error: 'Access denied' });
+  return null;
+}
+
+async function getTeamSiteDomains(userId, teamId) {
+  if (teamId) {
+    const membership = await prisma.teamMember.findFirst({ where: { teamId, userId } });
+    if (!membership) return [];
+    const sites = await prisma.site.findMany({ where: { teamId }, select: { domain: true } });
+    return sites.map((s) => s.domain);
+  }
+  const [owned, shared] = await Promise.all([
+    prisma.site.findMany({
+      where: { OR: [{ users: { some: { id: userId } } }, { team: { members: { some: { userId } } } }] },
+      select: { domain: true },
+    }),
+    prisma.boardAccess.findMany({ where: { userId }, include: { site: { select: { domain: true } } } }),
+  ]);
+  return [...new Set([...owned.map((s) => s.domain), ...shared.map((a) => a.site.domain)])];
+}
+
+// Single source of truth for plan limits — mirrors the pricing page
+const PLAN_LIMITS = {
+  free:    { reports: 100,      members: 5,        sites: 3 },
+  starter: { reports: 300,      members: 10,       sites: 5 },
+  team:    { reports: Infinity, members: Infinity,  sites: Infinity },
+  agency:  { reports: Infinity, members: Infinity,  sites: Infinity },
+};
+
 const bcrypt = require('bcryptjs');
 
 const { formatDistanceToNow } = require('date-fns');
 
 app.get('/api/activities', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const { teamId } = req.query;
   try {
+    const siteDomains = await getTeamSiteDomains(userId, teamId);
     const activitiesDb = await prisma.activity.findMany({
       where: {
-        OR: [
-          { userId: req.user.id },
-          {
-            report: {
-              Site: {
-                team: {
-                  members: {
-                    some: { userId: req.user.id },
-                  },
-                },
-              },
-            },
-          },
-        ],
+        report: {
+          site: { in: siteDomains },
+        },
       },
       include: {
         actor: true,
@@ -298,7 +576,7 @@ app.get('/api/activities', authenticateToken, async (req, res) => {
         dueDate,
         link: a.report
           ? `/reports/${a.report.siteName.toLowerCase()}?report=${a.report.id}`
-          : null,
+          : '',
       };
     });
 
@@ -309,7 +587,7 @@ app.get('/api/activities', authenticateToken, async (req, res) => {
 
     res.json(activities);
   } catch (err) {
-    console.error(err);
+    captureError(err);
     res.status(500).json({ error: 'Failed to fetch activities' });
   }
 });
@@ -324,6 +602,14 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
 
     const endOfDay = new Date();
     endOfDay.setHours(23, 59, 59, 999);
+
+    const requestingUser = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { notificationPrefs: true },
+    });
+    const prefs = requestingUser?.notificationPrefs;
+    const wantsOverdue = !prefs || prefs.taskOverdue !== false;
+    const wantsDueToday = !prefs || prefs.dueToday !== false;
 
     /* ----------------------------------
      * 1. Stored notifications
@@ -345,19 +631,22 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
      * 2. Overdue tasks
      * ---------------------------------- */
 
-    const overdueTasks = await prisma.qAReport.findMany({
-      where: {
-        userId,
-        dueDate: { lt: startOfDay },
-        status: { not: 'resolved' },
-      },
-      select: {
-        id: true,
-        title: true,
-        dueDate: true,
-        siteName: true,
-      },
-    });
+    const overdueTasks = wantsOverdue
+      ? await prisma.qAReport.findMany({
+          where: {
+            userId,
+            dueDate: { lt: startOfDay },
+            status: { notIn: ['done', 'resolved'] },
+          },
+          select: {
+            id: true,
+            title: true,
+            dueDate: true,
+            siteName: true,
+          },
+          take: 50,
+        })
+      : [];
 
     const overdueNotifications = overdueTasks.map((task) => ({
       id: `overdue-${task.id}`,
@@ -373,22 +662,25 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
      * 3. Tasks due today
      * ---------------------------------- */
 
-    const dueTodayTasks = await prisma.qAReport.findMany({
-      where: {
-        userId,
-        dueDate: {
-          gte: startOfDay,
-          lte: endOfDay,
-        },
-        status: { not: 'resolved' },
-      },
-      select: {
-        id: true,
-        title: true,
-        dueDate: true,
-        siteName: true,
-      },
-    });
+    const dueTodayTasks = wantsDueToday
+      ? await prisma.qAReport.findMany({
+          where: {
+            userId,
+            dueDate: {
+              gte: startOfDay,
+              lte: endOfDay,
+            },
+            status: { notIn: ['done', 'resolved'] },
+          },
+          select: {
+            id: true,
+            title: true,
+            dueDate: true,
+            siteName: true,
+          },
+          take: 50,
+        })
+      : [];
 
     const dueTodayNotifications = dueTodayTasks.map((task) => ({
       id: `today-${task.id}`,
@@ -428,7 +720,7 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
       notifications: merged,
     });
   } catch (err) {
-    console.error(err);
+    captureError(err);
     res.status(500).json({ error: 'Failed to fetch notifications' });
   }
 });
@@ -499,7 +791,7 @@ function stripTLD(url) {
 
     return parts.join('.');
   } catch (e) {
-    console.error('Invalid URL:', url);
+    captureError('Invalid URL:', url);
     return url;
   }
 }
@@ -529,17 +821,79 @@ async function logActivity({
       },
     });
   } catch (err) {
-    console.error('Failed to log activity:', err);
+    captureError('Failed to log activity:', err);
   }
 }
 
 module.exports = logActivity;
 
-app.post('/api/auth/register', async (req, res) => {
-  const { email, password, name, team } = req.body;
+// ── Email verification helper ───────────────────────────────────────────────
+async function sendVerificationEmail(email, name) {
+  const crypto = require('crypto');
+  const token = crypto.randomBytes(32).toString('hex');
+  const expires = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
 
-  if (!email || !password) {
+  await prisma.verificationToken.upsert({
+    where: { token },
+    update: { expires },
+    create: { identifier: `verify:${email}`, token, expires },
+  });
+
+  const verifyUrl = `${process.env.APP_URL}/verify-email?token=${token}`;
+  const displayName = name || email;
+
+  await resend.emails.send({
+    from: process.env.EMAIL_FROM || 'Annoture <onboarding@resend.dev>',
+    to: email,
+    subject: 'Verify your email address',
+    html: `
+      <div style="font-family:ui-sans-serif,system-ui,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#121212;color:#fff;border-radius:12px;">
+        <h1 style="font-size:20px;font-weight:600;margin-bottom:8px;">Verify your email</h1>
+        <p style="color:#aaa;font-size:14px;margin-bottom:24px;">Hi ${displayName}, click below to verify your email address and activate your account.</p>
+        <a href="${verifyUrl}"
+           style="display:inline-block;padding:12px 24px;background:#7c3aed;color:#fff;border-radius:8px;text-decoration:none;font-size:14px;font-weight:500;">
+          Verify email
+        </a>
+        <p style="color:#555;font-size:12px;margin-top:24px;">
+          This link expires in 24 hours. If you didn't create an account you can safely ignore this email.
+        </p>
+        <p style="color:#444;font-size:11px;margin-top:8px;">
+          Or copy this link: <a href="${verifyUrl}" style="color:#7c3aed;">${verifyUrl}</a>
+        </p>
+      </div>
+    `,
+  });
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const PASSWORD_RULES = [
+  { test: (p) => p.length >= 8,           msg: 'Password must be at least 8 characters.' },
+  { test: (p) => /[A-Z]/.test(p),         msg: 'Password must contain at least one uppercase letter.' },
+  { test: (p) => /[a-z]/.test(p),         msg: 'Password must contain at least one lowercase letter.' },
+  { test: (p) => /[0-9]/.test(p),         msg: 'Password must contain at least one number.' },
+  { test: (p) => /[^A-Za-z0-9]/.test(p), msg: 'Password must contain at least one special character.' },
+];
+
+app.post('/api/auth/register', authLimiter, async (req, res) => {
+  const { email: rawEmail, password, name, team } = req.body;
+
+  if (!rawEmail || !password) {
     return res.status(400).json({ error: 'Email and password are required' });
+  }
+
+  const email = rawEmail.trim().toLowerCase();
+
+  if (!EMAIL_RE.test(email)) {
+    return res.status(400).json({ error: 'Please enter a valid email address.' });
+  }
+
+  if (typeof password !== 'string' || password.length > 128) {
+    return res.status(400).json({ error: 'Password must be 128 characters or fewer.' });
+  }
+
+  const failedRule = PASSWORD_RULES.find((r) => !r.test(password));
+  if (failedRule) {
+    return res.status(400).json({ error: failedRule.msg });
   }
 
   try {
@@ -551,54 +905,119 @@ app.post('/api/auth/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
 
     const user = await prisma.user.create({
-      data: {
-        email,
-        name,
-        password: hashedPassword,
-      },
-
-      include: {
-        sites: true,
-      },
+      data: { email, name, password: hashedPassword },
+      include: { sites: true },
     });
 
     const token = jwt.sign(
-      {
-        name: user.name,
-        id: user.id,
-        email: user.email,
-        teams: [],
-      },
+      { name: user.name, id: user.id, email: user.email, teams: [] },
       process.env.JWT_SECRET,
-      {
-        expiresIn: '30d',
-      },
+      { expiresIn: '30d' },
     );
+
+    // Send verification email non-blocking — don't fail registration if email fails
+    sendVerificationEmail(email, name).catch((err) =>
+      captureError('Failed to send verification email:', err)
+    );
+
+    // Redeem any pending board invites for this email address
+    const pendingInvites = await prisma.boardInvite.findMany({
+      where: { email, used: false, expiresAt: { gt: new Date() } },
+    });
+    if (pendingInvites.length > 0) {
+      await Promise.all(
+        pendingInvites.map((invite) =>
+          prisma.boardAccess.upsert({
+            where: { siteId_userId: { siteId: invite.siteId, userId: user.id } },
+            update: { role: invite.role },
+            create: {
+              siteId: invite.siteId,
+              userId: user.id,
+              role: invite.role,
+              invitedById: invite.invitedById,
+            },
+          })
+        )
+      );
+      await prisma.boardInvite.updateMany({
+        where: { email, used: false },
+        data: { used: true },
+      });
+    }
 
     res.status(201).json({
       message: 'User registered',
-      user: { id: user.id, email: user.email },
+      user: { id: user.id, email: user.email, emailVerified: false },
       token,
     });
   } catch (err) {
-    console.error('Register error:', err);
+    captureError('Register error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+// Verify email — called when user clicks the link in their email
+app.get('/api/auth/verify-email', async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ error: 'Token is required' });
+
+  try {
+    const record = await prisma.verificationToken.findUnique({ where: { token } });
+
+    if (!record) return res.status(400).json({ error: 'Invalid or expired link' });
+    if (record.expires < new Date()) {
+      await prisma.verificationToken.delete({ where: { token } });
+      return res.status(400).json({ error: 'Link has expired — please request a new one' });
+    }
+
+    // identifier format is "verify:email"
+    const email = record.identifier.replace(/^verify:/, '');
+
+    await prisma.user.update({
+      where: { email },
+      data: { emailVerified: new Date() },
+    });
+
+    await prisma.verificationToken.delete({ where: { token } });
+
+    // Redirect to the frontend with a success flag
+    res.redirect(`${process.env.APP_URL}/login?verified=1`);
+  } catch (err) {
+    captureError('verify-email error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Resend verification email
+app.post('/api/auth/resend-verification', authLimiter, authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.emailVerified) return res.status(400).json({ error: 'Email already verified' });
+
+    await sendVerificationEmail(user.email, user.name);
+    res.json({ message: 'Verification email sent' });
+  } catch (err) {
+    captureError('resend-verification error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
 
   try {
     const user = await prisma.user.findUnique({ where: { email } });
 
-    if (!user || !user.password) {
+    // H4 — constant-time comparison to prevent user enumeration via timing
+    const DUMMY_HASH = '$2b$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012345';
+    const valid = user?.password ? await bcrypt.compare(password, user.password) : (await bcrypt.compare(password, DUMMY_HASH), false);
+    if (!user || !user.password || !valid) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const valid = await bcrypt.compare(password, user.password);
-    if (!valid) {
-      return res.status(401).json({ error: 'Invalid email or password' });
+    if (user.status !== 'active') {
+      await prisma.user.update({ where: { id: user.id }, data: { status: 'active' } });
     }
 
     const memberships = await prisma.teamMember.findMany({
@@ -629,7 +1048,7 @@ app.post('/api/auth/login', async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('Login error:', err);
+    captureError('Login error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -638,11 +1057,14 @@ function authenticateToken(req, res, next) {
   const authHeader = req.headers.authorization;
   const token = authHeader?.split(' ')[1];
 
-  if (!token) return res.sendStatus(401);
+  if (!token) return res.status(401).json({ error: 'Authentication required' });
 
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403);
+    if (err) return res.status(403).json({ error: 'Invalid or expired token' });
     req.user = user;
+    // Attach the authenticated user to Sentry scope so every error from
+    // this request is tagged with who triggered it
+    Sentry.setUser({ id: user.id, email: user.email, username: user.name });
     next();
   });
 }
@@ -652,7 +1074,13 @@ async function requireActivePlan(req, res, next) {
     // Get teamId from request body, or fall back to the first team the user belongs to
     let teamId = req.body.teamId;
 
-    if (!teamId) {
+    if (teamId) {
+      // A client-supplied teamId must actually belong to this user — otherwise
+      // someone could attach new sites/reports to (and consume the plan quota
+      // of) a team they have no membership in.
+      const membership = await prisma.teamMember.findFirst({ where: { teamId, userId: req.user.id } });
+      if (!membership) return res.status(403).json({ error: 'Access denied' });
+    } else {
       const userWithTeams = await prisma.user.findUnique({
         where: { id: req.user.id },
         include: { teamMembers: true },
@@ -678,22 +1106,16 @@ async function requireActivePlan(req, res, next) {
       return res.status(404).json({ error: 'Team not found' });
     }
 
-    // Plan comes from subscription if it exists, otherwise default to 'free'
-    const plan = team.subscription?.plan || 'free';
+    // team.plan is the authoritative plan field — every checkout/webhook path
+    // updates it alongside subscription.plan, but only team.plan is guaranteed
+    // to exist (a Subscription row isn't created until first checkout).
+    const plan = team.plan || 'free';
     const subscriptionStatus = team.subscription?.status || 'active';
-
-    // Plan limits
-    const PLAN_LIMITS = {
-      free: { reports: 50, members: 3, sites: 3 },
-      starter: { reports: 1000, members: 10, sites: 5 },
-      team: { reports: 5000, members: 50, sites: Infinity },
-      agency: { reports: Infinity, members: Infinity, sites: Infinity },
-    };
 
     const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
 
-    // Block inactive subscriptions for paid plans
-    if (plan !== 'free' && subscriptionStatus !== 'active') {
+    // Block inactive subscriptions — 'canceling' still has access until period end
+    if (plan !== 'free' && subscriptionStatus !== 'active' && subscriptionStatus !== 'canceling') {
       return res.status(402).json({
         error: 'Your subscription is inactive. Please update billing.',
       });
@@ -738,12 +1160,12 @@ async function requireActivePlan(req, res, next) {
 
     next();
   } catch (err) {
-    console.error('Plan check failed', err);
+    captureError('Plan check failed', err);
     res.status(500).json({ error: 'Subscription check failed' });
   }
 }
 
-app.post('/sites/create', authenticateToken, async (req, res) => {
+app.post('/sites/create', authenticateToken, requireActivePlan, async (req, res) => {
   const userId = req.user.id;
   const { name, url, teamId } = req.body;
 
@@ -784,9 +1206,10 @@ app.post('/sites/create', authenticateToken, async (req, res) => {
       data: { lastActive: new Date() },
     });
 
+    invalidateUserSites(userId);
     res.json({ site });
   } catch (err) {
-    console.error('Create site error:', err);
+    captureError('Create site error:', err);
 
     // Prisma unique constraint (domain must be unique)
     if (err.code === 'P2002') {
@@ -805,7 +1228,7 @@ app.post(
   uploadAttachments.single('logo'),
   async (req, res) => {
     const userId = req.user.id;
-    const { name, plan = 'free' } = req.body;
+    const { name } = req.body; // M1 — ignore plan from client; always create as 'free'
     const file = req.file;
 
     try {
@@ -813,7 +1236,8 @@ app.post(
 
       if (file) {
         // Generate a unique key for R2
-        const key = `team-logos/${Date.now()}_${file.originalname}`;
+        const sanitisedName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_'); // M5
+        const key = `team-logos/${Date.now()}_${sanitisedName}`;
 
         // Upload to Cloudflare R2
         await uploadBufferToR2(file.buffer, key, file.mimetype);
@@ -825,7 +1249,7 @@ app.post(
         data: {
           name,
           logo: logoUrl,
-          plan,
+          plan: 'free', // M1 — always free on creation; ignore client-supplied plan
           members: {
             create: {
               userId,
@@ -859,33 +1283,51 @@ const handleGenerateNewCode = () => {
   return `TEAM-${segments.join('-')}`;
 };
 
-app.post('/teams/:teamId/invite-link', async (req, res) => {
+app.post('/teams/:teamId/invite-link', authenticateToken, async (req, res) => {
   const { teamId } = req.params;
-  const { role = 'member' } = req.body;
+  const { role: requestedRole = 'member', oneTime = false } = req.body;
+
+  // H1 — membership check
+  const membership = await prisma.teamMember.findFirst({ where: { teamId, userId: req.user.id } });
+  if (!membership) return res.status(403).json({ error: 'Access denied' });
+
+  // Only owners may mint owner-role invite links — otherwise any member could
+  // generate a link that grants whoever opens it owner access.
+  const safeRequestedRole = ['member', 'owner'].includes(requestedRole) ? requestedRole : 'member';
+  const role = safeRequestedRole === 'owner' && membership.role !== 'owner' ? 'member' : safeRequestedRole;
 
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
   const code = handleGenerateNewCode();
 
   const invite = await prisma.teamInvite.create({
-    data: { teamId, code, expiresAt, role, email: null },
+    data: { teamId, code, expiresAt, role, email: null, oneTime: !!oneTime },
   });
 
   res.json({
     code,
+    oneTime: invite.oneTime,
     inviteUrl: `${process.env.APP_URL}/invite/${code}`,
   });
 });
 
-app.get('/teams/:teamId/invite-link', async (req, res) => {
+app.get('/teams/:teamId/invite-link', authenticateToken, async (req, res) => {
   const { teamId } = req.params;
-  const { role = 'member' } = req.body;
+  const { role: requestedRole = 'member' } = req.body || {};
+
+  // H4 — membership check
+  const membership = await prisma.teamMember.findFirst({ where: { teamId, userId: req.user.id } });
+  if (!membership) return res.status(403).json({ error: 'Access denied' });
+
+  const safeRequestedRole = ['member', 'owner'].includes(requestedRole) ? requestedRole : 'member';
+  const role = safeRequestedRole === 'owner' && membership.role !== 'owner' ? 'member' : safeRequestedRole;
 
   try {
-    // 1️⃣ Get most recent non-expired invite
+    // 1️⃣ Get most recent non-expired, not-yet-used invite
     const invite = await prisma.teamInvite.findFirst({
       where: {
         teamId,
         expiresAt: { gt: new Date() }, // still valid
+        used: false, // a one-time link that's already been redeemed shouldn't be handed out again
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -893,6 +1335,7 @@ app.get('/teams/:teamId/invite-link', async (req, res) => {
     if (invite) {
       return res.json({
         code: invite.code,
+        oneTime: invite.oneTime,
         inviteUrl: `${process.env.APP_URL}/invite/${invite.code}`,
       });
     } else {
@@ -906,11 +1349,12 @@ app.get('/teams/:teamId/invite-link', async (req, res) => {
 
       res.json({
         code: newInvite.code,
+        oneTime: newInvite.oneTime,
         inviteUrl: `${process.env.APP_URL}/invite/${newInvite.code}`,
       });
     }
   } catch (err) {
-    console.error('Failed to load invite code', err);
+    captureError('Failed to load invite code', err);
     res.status(500).json({ error: 'Failed to load invite code' });
   }
 });
@@ -923,7 +1367,16 @@ app.post(
   requireActivePlan,
   async (req, res) => {
     const { teamId } = req.params;
-    const { email, role = 'member' } = req.body;
+    const { email, role: requestedRole = 'member' } = req.body;
+
+    // Only existing team owners can invite, and only with an allowed role —
+    // closes a full team-takeover hole where any user could self-invite as owner.
+    const isOwner = await prisma.teamMember.findFirst({
+      where: { teamId, userId: req.user.id, role: 'owner' },
+    });
+    if (!isOwner) return res.status(403).json({ error: 'Only team owners can invite members' });
+
+    const role = ['member', 'owner'].includes(requestedRole) ? requestedRole : 'member';
 
     const inviterName = req.user.name;
     const code = handleGenerateNewCode();
@@ -950,7 +1403,7 @@ app.post(
       return res.status(400).json({ error: 'Invite has expired' });
     }
 
-    const inviteUrl = `${process.env.APP_URL}/regsiter?invite_code=${code}`;
+    const inviteUrl = `${process.env.APP_URL}/invite/${code}`;
 
     const emailHtml = `
     <div style="font-family: Arial, sans-serif; line-height: 1.6;">
@@ -988,7 +1441,7 @@ app.post(
   `;
 
     await resend.emails.send({
-      from: 'QA Tool <noreply@qatool.app>',
+      from: process.env.EMAIL_FROM || 'Annoture <onboarding@resend.dev>',
       to: email,
       subject: `You’ve been invited to join ${team.name} on QA Tool`,
       html: emailHtml,
@@ -1013,8 +1466,9 @@ app.post('/teams/join', authenticateToken, async (req, res) => {
   if (invite.expiresAt && invite.expiresAt < new Date())
     return res.status(400).json({ error: 'This invite has expired' });
 
-  // already accepted / used
-  if (invite.used) {
+  // email-specific invites are always single-use; link invites are reusable
+  // unless explicitly marked one-time
+  if ((invite.email !== null || invite.oneTime) && invite.used) {
     return res.status(400).json({ error: 'This invite has already been used' });
   }
 
@@ -1024,30 +1478,49 @@ app.post('/teams/join', authenticateToken, async (req, res) => {
   });
 
   if (existingMember) {
-    return res.status(200).json({ joined: true, alreadyMember: true });
+    return res.status(200).json({ joined: true, alreadyMember: true, teamName: invite.team.name });
   }
 
-  await prisma.$transaction([
-    prisma.teamMember.create({
-      data: {
-        teamId: invite.teamId,
-        userId,
-        role: invite.role,
-      },
-    }),
-    prisma.teamInvite.update({
-      where: { id: invite.id },
-      data: { used: true },
+  // Enforce member limit before joining
+  const [memberCount, teamForPlan] = await Promise.all([
+    prisma.teamMember.count({ where: { teamId: invite.teamId } }),
+    prisma.team.findUnique({
+      where: { id: invite.teamId },
+      include: { subscription: true },
     }),
   ]);
+  const joinPlan = teamForPlan?.subscription?.plan || 'free';
+  const joinLimits = PLAN_LIMITS[joinPlan] || PLAN_LIMITS.free;
+  if (memberCount >= joinLimits.members) {
+    return res.status(403).json({
+      error: `This team has reached its ${joinLimits.members}-member limit on the ${joinPlan} plan. Ask the team owner to upgrade.`,
+    });
+  }
 
-  res.json({ joined: true });
+  const ops = [
+    prisma.teamMember.create({
+      data: { teamId: invite.teamId, userId, role: invite.role },
+    }),
+  ];
+
+  // Only mark as used for single-use invites (email-specific or one-time links)
+  if (invite.email !== null || invite.oneTime) {
+    ops.push(prisma.teamInvite.update({ where: { id: invite.id }, data: { used: true } }));
+  }
+
+  await prisma.$transaction(ops);
+
+  res.json({ joined: true, teamName: invite.team.name });
 });
 
 app.get('/teams/:teamId/members', authenticateToken, async (req, res) => {
   const { teamId } = req.params;
 
   try {
+    // H2 — membership check
+    const isMember = await prisma.teamMember.findFirst({ where: { teamId, userId: req.user.id } });
+    if (!isMember) return res.status(403).json({ error: 'Access denied' });
+
     const members = await prisma.teamMember.findMany({
       where: { teamId },
       include: {
@@ -1080,8 +1553,46 @@ app.get('/teams/:teamId/members', authenticateToken, async (req, res) => {
 
     res.json({ members: result });
   } catch (err) {
-    console.error(err);
+    captureError(err);
     res.status(500).json({ error: 'Failed to load team members' });
+  }
+});
+
+app.delete('/teams/:teamId/members/:userId', authenticateToken, async (req, res) => {
+  const { teamId, userId } = req.params;
+  const callerId = req.user.id;
+
+  try {
+    // Only team owners can remove members
+    const callerMembership = await prisma.teamMember.findFirst({
+      where: { teamId, userId: callerId },
+    });
+    if (!callerMembership || callerMembership.role !== 'owner') {
+      return res.status(403).json({ error: 'Only team owners can remove members' });
+    }
+
+    // Cannot remove the last owner
+    const targetMembership = await prisma.teamMember.findFirst({
+      where: { teamId, userId },
+    });
+    if (!targetMembership) {
+      return res.status(404).json({ error: 'Member not found in this team' });
+    }
+    if (targetMembership.role === 'owner') {
+      const ownerCount = await prisma.teamMember.count({ where: { teamId, role: 'owner' } });
+      if (ownerCount <= 1) {
+        return res.status(400).json({ error: 'Cannot remove the last owner of a team' });
+      }
+    }
+
+    await prisma.teamMember.delete({
+      where: { userId_teamId: { userId, teamId } },
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Remove member error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1117,43 +1628,84 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
           }
         : null,
       role: isOwner ? 'owner' : 'member',
+      emailVerified: !!user.emailVerified,
+      notificationPrefs: user.notificationPrefs ?? null,
+      lastSeenNotificationsAt: user.lastSeenNotificationsAt ?? null,
     },
   });
+});
+
+// POST /api/notifications/mark-seen — records that the user has seen all
+// notifications up to now, so the toast watcher doesn't replay them.
+app.post('/api/notifications/mark-seen', authenticateToken, async (req, res) => {
+  try {
+    const updated = await prisma.user.update({
+      where: { id: req.user.id },
+      data: { lastSeenNotificationsAt: new Date() },
+      select: { lastSeenNotificationsAt: true },
+    });
+    res.json({ lastSeenNotificationsAt: updated.lastSeenNotificationsAt });
+  } catch (error) {
+    captureError('Failed to mark notifications seen:', error);
+    res.status(500).json({ error: 'Failed to mark notifications seen' });
+  }
 });
 
 app.post(
   '/api/report',
   authenticateToken,
+  uploadLimiter,
+  uploadAttachments.single('screenshot'), // must run before requireActivePlan so req.body is populated
   requireActivePlan,
-  uploadAttachments.single('screenshot'),
   async (req, res) => {
-    const { url, comment, x, y, title, priority, type, dueDate, teamId, pageTitle, browser, os, screenSize } =
+    const { url, comment, x, y, title, priority, type, dueDate, teamId, pageTitle, browser, os, screenSize, viewport, cssPath, consoleLogs } =
       req.body;
     const file = req.file;
 
     if (!file) return res.status(400).json({ error: 'No screenshot uploaded' });
 
+    // consoleLogs arrives as a JSON string from the extension, already redacted client-side.
+    // Re-validate shape/size server-side too — never trust the client as the only guard.
+    let parsedConsoleLogs = null;
+    if (consoleLogs) {
+      try {
+        const parsed = JSON.parse(consoleLogs);
+        if (Array.isArray(parsed)) {
+          parsedConsoleLogs = parsed
+            .slice(-25)
+            .filter((entry) => entry && typeof entry.message === 'string')
+            .map((entry) => ({
+              level: entry.level === 'warn' ? 'warn' : 'error',
+              message: String(entry.message).slice(0, 500),
+              timestamp: typeof entry.timestamp === 'string' ? entry.timestamp : new Date().toISOString(),
+            }));
+        }
+      } catch {
+        parsedConsoleLogs = null; // malformed payload — drop silently rather than fail the report
+      }
+    }
+
     const domain = new URL(url).hostname.replace('www.', '');
     const siteName = pageTitle || domain;
 
     try {
-      // Make sure user exists
-      const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-      if (!user) return res.status(400).json({ error: 'User not found' });
-
-      // Determine team
-      const userTeamId = teamId || (await getUserTeamIds(req))[0];
+      // Determine team from JWT (synchronous — no DB hit)
+      const userTeamId = teamId || getUserTeamIds(req)[0];
       if (!userTeamId)
         return res.status(400).json({ error: 'No team available' });
 
-      // Make sure team exists
-      const team = await prisma.team.findUnique({ where: { id: userTeamId } });
-      if (!team) return res.status(400).json({ error: 'Team not found' });
+      // Run user/team validation and R2 upload in parallel
+      const sanitisedScreenshotName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_'); // M5
+      const key = `screenshots/${Date.now()}_${sanitisedScreenshotName}`;
+      const [user, team, , signedUrl] = await Promise.all([
+        prisma.user.findUnique({ where: { id: req.user.id } }),
+        prisma.team.findUnique({ where: { id: userTeamId } }),
+        uploadBufferToR2(file.buffer, key, file.mimetype),
+        getSignedR2Url(key),
+      ]);
 
-      // Upload screenshot
-      const key = `screenshots/${Date.now()}_${file.originalname}`;
-      await uploadBufferToR2(file.buffer, key, file.mimetype);
-      const signedUrl = await getSignedR2Url(key);
+      if (!user) return res.status(400).json({ error: 'User not found' });
+      if (!team) return res.status(400).json({ error: 'Team not found' });
 
       const slug = stripTLD(url);
 
@@ -1173,6 +1725,9 @@ app.post(
           browser,
           os,
           screenSize,
+          viewport,
+          cssPath: cssPath || null,
+          consoleLogs: parsedConsoleLogs,
           priority,
           type,
           dueDate: dueDate ? new Date(dueDate) : null,
@@ -1219,23 +1774,27 @@ app.post(
         userName: req.user.name,
       };
 
-      const metadataPath = path.join('uploads', `${report.id}.json`);
-      fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+      // Respond immediately — fire remaining tasks without blocking
+      res.json(report);
 
-      await prisma.user.update({
+      // Invalidate cached stats + sites for this user so dashboard reflects new report
+      invalidateUserStats(req.user.id);
+      invalidateUserSites(req.user.id);
+
+      // Non-blocking: write metadata file and update lastActive after response
+      fs.writeFile(path.join('uploads', `${report.id}.json`), JSON.stringify(metadata, null, 2), () => {});
+      prisma.user.update({
         where: { id: req.user.id },
         data: { lastActive: new Date() },
-      });
+      }).catch((err) => captureError('lastActive update failed:', err));
 
       // Notify all clients viewing this site's board in real time
       io.to(`site:${slug}`).emit('board:event', {
         type: 'report:created',
         reportId: report.id,
       });
-
-      res.json(report);
     } catch (error) {
-      console.error('Error saving report:', error);
+      captureError('Error saving report:', error);
       res.status(500).json({ error: 'Failed to save report' });
     }
   },
@@ -1327,7 +1886,7 @@ app.get('/api/report', authenticateToken, async (req, res) => {
 
     res.json(grouped);
   } catch (error) {
-    console.error('Error fetching reports:', error);
+    captureError('Error fetching reports:', error);
     res.status(500).json({ error: 'Failed to fetch reports' });
   }
 });
@@ -1344,15 +1903,22 @@ app.get('/api/report/:id', authenticateToken, async (req, res) => {
           // ✅ Report owner
           { userId },
 
-          // ✅ Invited to the board (Site)
+          // ✅ Team member of the board's owning team
           {
             Site: {
               team: {
                 members: {
-                  some: {
-                    userId,
-                  },
+                  some: { userId },
                 },
+              },
+            },
+          },
+
+          // ✅ Board-level guest (BoardAccess)
+          {
+            Site: {
+              boardAccesses: {
+                some: { userId },
               },
             },
           },
@@ -1362,11 +1928,13 @@ app.get('/api/report/:id', authenticateToken, async (req, res) => {
         id: true,
         imagePath: true,
         title: true,
+        status: true,
         priority: true,
         type: true,
         comment: true,
         url: true,
         site: true,
+        pagePath: true,
         dueDate: true,
         slug: true,
         siteName: true,
@@ -1375,6 +1943,12 @@ app.get('/api/report/:id', authenticateToken, async (req, res) => {
         timestamp: true,
         userId: true,
         userName: true,
+        browser: true,
+        os: true,
+        screenSize: true,
+        viewport: true,
+        cssPath: true,
+        consoleLogs: true,
       },
     });
 
@@ -1393,34 +1967,52 @@ app.get('/api/report/:id', authenticateToken, async (req, res) => {
       timestamp: report.timestamp.toISOString(),
     });
   } catch (error) {
-    console.error('Error fetching report:', error);
+    captureError('Error fetching report:', error);
     res.status(500).json({ error: 'Failed to fetch report' });
   }
 });
 
 // GET /api/sites
-app.get('/api/sites', authenticateToken, async (req, res) => {
+app.get('/api/sites', authenticateToken, cacheMiddleware((req) => `sites:${req.user.id}:${req.query.teamId || ''}`, TTL.SITES), async (req, res) => {
   const userId = req.user.id;
+  const { teamId } = req.query;
 
   try {
-    // 1️⃣ Get all sites the user has access to
-    let accessibleSites = await prisma.site.findMany({
-      where: {
-        OR: [
-          { users: { some: { id: userId } } },
-          {
-            team: {
-              members: { some: { userId } },
-            },
-          },
-        ],
-      },
+    // 1️⃣ Get sites scoped to the active team (or all accessible sites if no teamId)
+    const teamFilter = teamId
+      ? { teamId }
+      : { OR: [{ users: { some: { id: userId } } }, { team: { members: { some: { userId } } } }] };
+
+    const ownedSites = await prisma.site.findMany({
+      where: teamFilter,
       select: {
         id: true,
         domain: true,
+        slug: true,
         siteUsers: { where: { userId }, select: { isPinned: true } },
       },
     });
+
+    // 1b️⃣ Also include boards shared with this user via BoardAccess (scoped to team if provided)
+    const sharedAccesses = await prisma.boardAccess.findMany({
+      where: { userId, ...(teamId ? { site: { teamId } } : {}) },
+      include: {
+        site: {
+          select: {
+            id: true,
+            domain: true,
+            slug: true,
+            siteUsers: { where: { userId }, select: { isPinned: true } },
+          },
+        },
+      },
+    });
+    const sharedSites = sharedAccesses.map((a) => ({ ...a.site, isShared: true, sharedRole: a.role }));
+
+    const accessibleSites = [
+      ...ownedSites.map((s) => ({ ...s, isShared: false, sharedRole: null })),
+      ...sharedSites,
+    ];
 
     // Deduplicate by domain
     const uniqueSites = [];
@@ -1502,7 +2094,7 @@ app.get('/api/sites', authenticateToken, async (req, res) => {
       return {
         id: latest?.id || null,
         site: site.domain,
-        slug: site.domain,
+        slug: site.slug ?? site.domain,
         siteName: latest?.siteName || site.domain,
         members: membersByDomain[site.domain] || [],
         counts,
@@ -1511,6 +2103,8 @@ app.get('/api/sites', authenticateToken, async (req, res) => {
         lastUpdated: latest?.timestamp || null,
         isPinned: site.siteUsers[0]?.isPinned ?? false,
         siteStatus: siteData[site.domain]?.archived ? 'archived' : 'active',
+        isShared: site.isShared ?? false,
+        sharedRole: site.sharedRole ?? null,
       };
     });
 
@@ -1521,7 +2115,7 @@ app.get('/api/sites', authenticateToken, async (req, res) => {
 
     res.json(sitesWithDetails);
   } catch (error) {
-    console.error('Error fetching accessible sites:', error);
+    captureError('Error fetching accessible sites:', error);
     res.status(500).json({ error: 'Failed to fetch sites' });
   }
 });
@@ -1535,7 +2129,7 @@ app.post('/api/site/:slug/pin', authenticateToken, async (req, res) => {
     // Find the site by slug
     const site = await prisma.site.findFirst({
       where: { slug },
-      select: { id: true },
+      select: { id: true, teamId: true },
     });
 
     if (!site) {
@@ -1543,6 +2137,11 @@ app.post('/api/site/:slug/pin', authenticateToken, async (req, res) => {
         .status(404)
         .json({ error: `Site with slug "${slug}" not found` });
     }
+
+    const hasAccess =
+      (site.teamId && (await prisma.teamMember.findFirst({ where: { teamId: site.teamId, userId } }))) ||
+      (await prisma.boardAccess.findUnique({ where: { siteId_userId: { siteId: site.id, userId } } }));
+    if (!hasAccess) return res.status(403).json({ error: 'Access denied' });
 
     await prisma.siteUser.upsert({
       where: { userId_siteId: { userId, siteId: site.id } },
@@ -1557,7 +2156,7 @@ app.post('/api/site/:slug/pin', authenticateToken, async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Failed to pin site:', err); // This will log the actual error
+    captureError('Failed to pin site:', err); // This will log the actual error
     res.status(500).json({ error: 'Failed to pin site' });
   }
 });
@@ -1596,40 +2195,40 @@ app.post('/api/site/:slug/unpin', authenticateToken, async (req, res) => {
 
     res.json({ success: true, message: `Site "${slug}" unpinned` });
   } catch (err) {
-    console.error('Failed to unpin site:', err);
+    captureError('Failed to unpin site:', err);
     res.status(500).json({ error: 'Failed to unpin site' });
   }
 });
 
 app.get('/api/users-tasks', authenticateToken, async (req, res) => {
   const userId = req.user.id;
+  const { teamId } = req.query;
 
   try {
-    // Step 1: Get all sites the user has access to
-    const sites = await prisma.site.findMany({
-      where: {
-        users: {
-          some: { id: userId },
+    // Step 1: Get sites for the active team (or all accessible sites if no teamId)
+    const siteDomains = await getTeamSiteDomains(userId, teamId);
+
+    if (!siteDomains.length) return res.json([]);
+
+    // Step 2: Get all reports for those sites assigned to this user
+    const [reports, customColumns] = await Promise.all([
+      prisma.qAReport.findMany({
+        where: {
+          site: { in: siteDomains },
+          archived: false,
+          status: { not: 'done' },
+          userId: userId,
         },
-      },
-      select: {
-        domain: true,
-        name: true,
-      },
-    });
+        orderBy: { timestamp: 'desc' },
+        take: 500,
+      }),
+      prisma.kanbanColumn.findMany({
+        where: { site: { domain: { in: siteDomains } } },
+        select: { id: true, name: true },
+      }),
+    ]);
 
-    const siteDomains = sites.map((s) => s.domain);
-
-    // Step 2: Get all reports for those sites
-    const reports = await prisma.qAReport.findMany({
-      where: {
-        site: { in: siteDomains },
-        archived: false,
-        status: { not: 'done' },
-        userId: userId,
-      },
-      orderBy: { timestamp: 'desc' },
-    });
+    const columnNameMap = Object.fromEntries(customColumns.map((c) => [c.id, c.name]));
 
     // Helper: map status -> color
     const statusColors = {
@@ -1643,15 +2242,9 @@ app.get('/api/users-tasks', authenticateToken, async (req, res) => {
     function formatDate(date) {
       const today = new Date();
       const input = new Date(date);
-
       const isToday = today.toDateString() === input.toDateString();
-
       if (isToday) return 'Today';
-
-      return input.toLocaleDateString('en-GB', {
-        day: 'numeric',
-        month: 'short',
-      });
+      return input.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
     }
 
     // Step 3: Transform into your TASK format
@@ -1659,10 +2252,11 @@ app.get('/api/users-tasks', authenticateToken, async (req, res) => {
       id: r.id,
       title: r.comment || 'Untitled Task',
       status: r.status || 'Open',
-      priority: r.priority || 'Medium', // if you add priority later, this will match automatically
+      statusLabel: columnNameMap[r.status] ?? null,
+      priority: r.priority || 'Medium',
       dueDate: formatDate(r.timestamp),
       project: r.siteName || r.site,
-      statusColor: statusColors[r.status] || 'blue',
+      statusColor: statusColors[r.status] || 'purple',
     }));
 
     await prisma.user.update({
@@ -1672,55 +2266,53 @@ app.get('/api/users-tasks', authenticateToken, async (req, res) => {
 
     res.json(tasks);
   } catch (error) {
-    console.error('Error generating tasks:', error);
+    captureError('Error generating tasks:', error);
     res.status(500).json({ error: 'Failed to load tasks' });
   }
 });
 
 app.get('/api/tasks', authenticateToken, async (req, res) => {
   const userId = req.user.id;
+  const { teamId } = req.query;
 
   try {
     /**
-     * 1️⃣ Get all ACTIVE sites the user has access to
+     * 1️⃣ Get all sites scoped to the active team
      */
-    const sites = await prisma.site.findMany({
-      where: {
-        users: {
-          some: { id: userId },
-        },
-      },
-      select: {
-        domain: true,
-        name: true,
-      },
-    });
+    const siteDomains = await getTeamSiteDomains(userId, teamId);
 
-    if (!sites.length) {
+    if (!siteDomains.length) {
       return res.json([]);
     }
 
-    const siteDomains = sites.map((s) => s.domain);
-
     /**
-     * 2️⃣ Fetch all NON-ARCHIVED tasks for those sites
+     * 2️⃣ Fetch all NON-ARCHIVED tasks assigned to this user across those sites
      */
-    const reports = await prisma.qAReport.findMany({
-      where: {
-        site: { in: siteDomains },
-        archived: false,
-        // status: { not: 'done' },
-      },
-      orderBy: { timestamp: 'desc' },
-      include: {
-        user: {
-          select: {
-            id: true,
-            name: true,
+    const [reports, customColumns] = await Promise.all([
+      prisma.qAReport.findMany({
+        where: {
+          site: { in: siteDomains },
+          archived: false,
+          userId,
+        },
+        orderBy: { timestamp: 'desc' },
+        take: 500,
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+            },
           },
         },
-      },
-    });
+      }),
+      prisma.kanbanColumn.findMany({
+        where: { site: { domain: { in: siteDomains } } },
+        select: { id: true, name: true },
+      }),
+    ]);
+
+    const columnNameMap = Object.fromEntries(customColumns.map((c) => [c.id, c.name]));
 
     /**
      * 3️⃣ Transform into frontend-friendly TASK shape
@@ -1737,6 +2329,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
       title: r.title,
       comment: r.comment,
       status: r.status,
+      statusLabel: columnNameMap[r.status] ?? null,
       priority: r.priority || 'medium',
       site: r.site,
       siteName: r.siteName || r.site,
@@ -1745,7 +2338,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
         name: r.user?.name,
       },
       createdAt: r.timestamp,
-      statusColor: statusColors[r.status] || 'blue',
+      statusColor: statusColors[r.status] || 'purple',
       dueDate: r.dueDate,
       slug: r.slug,
     }));
@@ -1757,7 +2350,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
 
     res.json(tasks);
   } catch (error) {
-    console.error('Failed to fetch tasks:', error);
+    captureError('Failed to fetch tasks:', error);
     res.status(500).json({ error: 'Failed to fetch tasks' });
   }
 });
@@ -1774,6 +2367,7 @@ app.get('/api/archive', authenticateToken, async (req, res) => {
       orderBy: {
         archivedAt: 'desc',
       },
+      take: 200,
     });
 
     await prisma.user.update({
@@ -1783,7 +2377,7 @@ app.get('/api/archive', authenticateToken, async (req, res) => {
 
     res.json(archivedReports);
   } catch (error) {
-    console.error('Failed to fetch archived reports:', error);
+    captureError('Failed to fetch archived reports:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1793,17 +2387,15 @@ app.get('/api/site/:slug', authenticateToken, async (req, res) => {
   const { slug } = req.params;
   const { teamId } = req.query;
 
-  if (!teamId) {
-    return res.status(400).json({ error: 'teamId is required' });
+  const siteExists = await prisma.site.findFirst({
+    where: { OR: [{ slug }, { domain: slug }] },
+    select: { id: true },
+  });
+  if (!siteExists) {
+    return res.status(404).json({ error: 'Site not found' });
   }
 
-  const site = await prisma.site.findFirst({
-    where: { slug, teamId },
-  });
-
-  console.log(slug);
-  console.log(teamId);
-
+  const site = await resolveSiteForUser(slug, teamId, req.user.id);
   if (!site) {
     return res.status(403).json({ error: 'Access denied to this site' });
   }
@@ -1816,22 +2408,52 @@ app.get('/api/site/:slug', authenticateToken, async (req, res) => {
   res.json(reports);
 });
 
+// GET /api/site/:slug/public-status — no auth required
+app.get('/api/site/:slug/public-status', apiLimiter, async (req, res) => {
+  try {
+    const site = await prisma.site.findFirst({ where: { slug: req.params.slug } });
+    if (!site) return res.status(404).json({ error: 'Site not found' });
+
+    const reports = await prisma.qAReport.findMany({
+      where: { site: site.domain },
+      select: { status: true, priority: true, timestamp: true },
+    });
+
+    const counts = { new: 0, inProgress: 0, done: 0 };
+    const priorities = { urgent: 0, high: 0, medium: 0, low: 0, 'not assigned': 0 };
+
+    for (const r of reports) {
+      if (r.status in counts) counts[r.status]++;
+      else counts[r.status] = (counts[r.status] || 0) + 1; // custom columns
+      const p = r.priority || 'not assigned';
+      if (p in priorities) priorities[p]++;
+      else priorities['not assigned']++;
+    }
+
+    const total = reports.length;
+    const lastUpdated = reports.length > 0
+      ? reports.reduce((latest, r) => r.timestamp > latest ? r.timestamp : latest, reports[0].timestamp)
+      : null;
+
+    res.json({
+      siteName: site.siteName || site.domain,
+      siteUrl: site.domain,
+      slug: site.slug,
+      total,
+      counts,
+      priorities,
+      lastUpdated,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Invite a user to collaborate on a site
 app.post('/api/site/:slug/invite', authenticateToken, async (req, res) => {
   const { slug } = req.params;
-  const { email, userId, teamId } = req.body;
-
-  const isAdmin = await prisma.teamMember.findFirst({
-    where: {
-      teamId: teamId,
-      userId: req.user.id,
-      role: 'owner',
-    },
-  });
-
-  if (!isAdmin) {
-    return res.status(403).json({ error: 'Only admins can invite users' });
-  }
+  const { email, userId } = req.body;
 
   if (!slug || !email) {
     return res.status(400).json({ error: 'slug and email are required' });
@@ -1842,26 +2464,32 @@ app.post('/api/site/:slug/invite', authenticateToken, async (req, res) => {
   }
 
   try {
-    // 1. Load site
+    // 1. Load site — teamId is derived from the site itself, never trusted from the client
     const site = await prisma.site.findFirst({
       where: { slug },
       select: { id: true, teamId: true },
     });
+
+    if (!site) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+
+    const isAdmin = await prisma.teamMember.findFirst({
+      where: { teamId: site.teamId, userId: req.user.id, role: 'owner' },
+    });
+    if (!isAdmin) {
+      return res.status(403).json({ error: 'Only admins can invite users' });
+    }
 
     // 1. Find user by email
     const user = await prisma.user.findUnique({
       where: { email },
     });
 
+    // H5 — don't reveal whether email is registered; silently succeed if not found
     if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+      return res.json({ message: 'If that email is registered, an invite has been sent.' });
     }
-
-    if (!site) {
-      return res.status(404).json({ error: 'Site not found' });
-    }
-
-    console.log('Connecting user to site', { slug, userId: user.id });
 
     // 3. Connect user to site (many-to-many)
     await prisma.site.update({
@@ -1878,15 +2506,260 @@ app.post('/api/site/:slug/invite', authenticateToken, async (req, res) => {
       data: { lastActive: new Date() },
     });
 
-    return res.json({ message: 'User invited successfully' });
+    return res.json({ message: 'If that email is registered, an invite has been sent.' });
   } catch (error) {
-    console.error('Error inviting user:', error);
+    captureError('Error inviting user:', error);
     return res.status(500).json({ error: 'Unable to invite user to site' });
   }
 });
 
+// ── Board sharing ──────────────────────────────────────────────────────────────
+
+// POST /api/site/:slug/share  — invite someone by email to a specific board
+app.post('/api/site/:slug/share', authenticateToken, async (req, res) => {
+  const { slug } = req.params;
+  const { email, role = 'viewer' } = req.body;
+
+  if (!email) return res.status(400).json({ error: 'email is required' });
+  if (!['viewer', 'commenter', 'editor'].includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+
+  try {
+    const site = await prisma.site.findFirst({
+      where: { slug },
+      select: { id: true, teamId: true, name: true, slug: true },
+    });
+    if (!site) return res.status(404).json({ error: 'Site not found' });
+
+    // Requester must own or be a member of the team that owns this board
+    const membership = await prisma.teamMember.findFirst({
+      where: { teamId: site.teamId, userId: req.user.id },
+    });
+    if (!membership) return res.status(403).json({ error: 'Access denied' });
+
+    // Don't invite someone who is already a member of the owning team
+    const invitee = await prisma.user.findUnique({ where: { email } });
+    if (invitee) {
+      const alreadyMember = await prisma.teamMember.findFirst({
+        where: { teamId: site.teamId, userId: invitee.id },
+      });
+      if (alreadyMember) {
+        return res.status(409).json({ error: 'This user is already a team member and has full access' });
+      }
+
+      // Grant access immediately if they already have an account
+      await prisma.boardAccess.upsert({
+        where: { siteId_userId: { siteId: site.id, userId: invitee.id } },
+        update: { role },
+        create: { siteId: site.id, userId: invitee.id, role, invitedById: req.user.id },
+      });
+      // Bust the invitee's sites cache so they see the board immediately
+      invalidateUserSites(invitee.id);
+    }
+
+    // Always create/update an invite record (so we can email them)
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const invite = await prisma.boardInvite.create({
+      data: { siteId: site.id, email, role, invitedById: req.user.id, expiresAt },
+    });
+
+    const inviteUrl = `${process.env.APP_URL}/board-invite/${invite.token}`;
+    const inviterName = req.user.name || 'A teammate';
+    const roleName = role.charAt(0).toUpperCase() + role.slice(1);
+
+    const fromAddress = process.env.EMAIL_FROM || 'Annoture <onboarding@resend.dev>';
+
+    // Send email non-blocking — invite record is already created, don't fail if email errors
+    resend.emails.send({
+      from: fromAddress,
+      to: email,
+      subject: `${inviterName} shared a board with you on Annoture`,
+      html: `
+        <div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto;background:#0f0f0f;color:#f5f5f5;border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,0.08)">
+          <div style="padding:32px">
+            <div style="display:inline-flex;align-items:center;gap:10px;margin-bottom:24px">
+              <div style="width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#8B5CF6,#6366F1);display:flex;align-items:center;justify-content:center">
+                <span style="color:white;font-size:16px">✓</span>
+              </div>
+              <span style="font-weight:600;font-size:16px">Annoture</span>
+            </div>
+            <h2 style="margin:0 0 8px;font-size:20px;font-weight:600">${inviterName} invited you to view a board</h2>
+            <p style="color:rgba(255,255,255,0.5);margin:0 0 24px;font-size:14px">
+              You've been given <strong style="color:#a78bfa">${roleName}</strong> access to the
+              <strong style="color:#f5f5f5">${site.name}</strong> board.
+            </p>
+            <a href="${inviteUrl}" style="display:inline-block;background:linear-gradient(135deg,#7C3AED,#6366F1);color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px">
+              Open board →
+            </a>
+            <p style="color:rgba(255,255,255,0.3);font-size:12px;margin-top:24px">
+              This invite expires on ${expiresAt.toLocaleDateString()}. If you weren't expecting this, you can safely ignore it.
+            </p>
+          </div>
+        </div>
+      `,
+    }).then(({ error }) => {
+      if (error) captureError('board share email error:', error);
+    }).catch((err) => captureError('board share email exception:', err));
+
+    res.json({ success: true, inviteUrl, message: invitee ? 'Access granted and invite sent' : 'Invite sent — they\'ll get access when they sign up' });
+  } catch (err) {
+    captureError('board share error:', err);
+    res.status(500).json({ error: 'Failed to send invite' });
+  }
+});
+
+// GET /api/site/:slug/share  — list who has board-level guest access
+app.get('/api/site/:slug/share', authenticateToken, async (req, res) => {
+  const { slug } = req.params;
+  try {
+    const site = await prisma.site.findFirst({
+      where: { slug },
+      select: { id: true, teamId: true },
+    });
+    if (!site) return res.status(404).json({ error: 'Site not found' });
+
+    const membership = await prisma.teamMember.findFirst({
+      where: { teamId: site.teamId, userId: req.user.id },
+    });
+    if (!membership) return res.status(403).json({ error: 'Access denied' });
+
+    const accesses = await prisma.boardAccess.findMany({
+      where: { siteId: site.id },
+      include: { user: { select: { id: true, name: true, email: true } } },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const pending = await prisma.boardInvite.findMany({
+      where: { siteId: site.id, used: false, expiresAt: { gt: new Date() } },
+      select: { id: true, email: true, role: true, expiresAt: true },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    res.json({ accesses, pending });
+  } catch (err) {
+    captureError('board share list error:', err);
+    res.status(500).json({ error: 'Failed to load access list' });
+  }
+});
+
+// PATCH /api/site/:slug/share/:userId  — change a guest's role
+app.patch('/api/site/:slug/share/:userId', authenticateToken, async (req, res) => {
+  const { slug, userId } = req.params;
+  const { role } = req.body;
+  if (!['viewer', 'commenter', 'editor'].includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+  try {
+    const site = await prisma.site.findFirst({ where: { slug }, select: { id: true, teamId: true } });
+    if (!site) return res.status(404).json({ error: 'Site not found' });
+
+    const membership = await prisma.teamMember.findFirst({
+      where: { teamId: site.teamId, userId: req.user.id },
+    });
+    if (!membership) return res.status(403).json({ error: 'Access denied' });
+
+    await prisma.boardAccess.update({
+      where: { siteId_userId: { siteId: site.id, userId } },
+      data: { role },
+    });
+    res.json({ success: true });
+  } catch (err) {
+    captureError('board share patch error:', err);
+    res.status(500).json({ error: 'Failed to update role' });
+  }
+});
+
+// DELETE /api/site/:slug/share/:userId  — revoke a guest's access
+app.delete('/api/site/:slug/share/:userId', authenticateToken, async (req, res) => {
+  const { slug, userId } = req.params;
+  try {
+    const site = await prisma.site.findFirst({ where: { slug }, select: { id: true, teamId: true } });
+    if (!site) return res.status(404).json({ error: 'Site not found' });
+
+    const membership = await prisma.teamMember.findFirst({
+      where: { teamId: site.teamId, userId: req.user.id },
+    });
+    if (!membership) return res.status(403).json({ error: 'Access denied' });
+
+    await prisma.boardAccess.delete({
+      where: { siteId_userId: { siteId: site.id, userId } },
+    });
+    res.json({ success: true });
+  } catch (err) {
+    captureError('board share delete error:', err);
+    res.status(500).json({ error: 'Failed to revoke access' });
+  }
+});
+
+// POST /api/board-invite/:token/accept  — accept a board invite link
+app.post('/api/board-invite/:token/accept', authenticateToken, async (req, res) => {
+  const { token } = req.params;
+  try {
+    // Fetch invite first so we can return friendly errors outside the transaction
+    const invite = await prisma.boardInvite.findUnique({
+      where: { token },
+      include: { site: { select: { id: true, slug: true, name: true } } },
+    });
+    if (!invite) return res.status(404).json({ error: 'Invite not found' });
+    if (invite.expiresAt < new Date()) return res.status(410).json({ error: 'This invite has expired' });
+
+    // Mark as used and create access atomically to prevent double-acceptance
+    await prisma.$transaction(async (tx) => {
+      const fresh = await tx.boardInvite.findUnique({ where: { token }, select: { used: true } });
+      if (fresh?.used) throw Object.assign(new Error('ALREADY_USED'), { status: 410 });
+      await tx.boardInvite.update({ where: { token }, data: { used: true } });
+      await tx.boardAccess.upsert({
+        where: { siteId_userId: { siteId: invite.siteId, userId: req.user.id } },
+        update: { role: invite.role },
+        create: { siteId: invite.siteId, userId: req.user.id, role: invite.role, invitedById: invite.invitedById },
+      });
+    });
+
+    invalidateUserSites(req.user.id);
+    res.json({ success: true, slug: invite.site.slug, siteName: invite.site.name });
+  } catch (err) {
+    if (err.message === 'ALREADY_USED') return res.status(410).json({ error: 'This invite has already been used' });
+    captureError('board invite accept error:', err);
+    res.status(500).json({ error: 'Failed to accept invite' });
+  }
+});
+
+// GET /api/me/shared-boards  — boards shared with the current user from other teams
+app.get('/api/me/shared-boards', authenticateToken, async (req, res) => {
+  try {
+    const accesses = await prisma.boardAccess.findMany({
+      where: { userId: req.user.id },
+      include: {
+        site: {
+          select: {
+            id: true, name: true, slug: true, domain: true,
+            team: { select: { name: true } },
+            reports: { select: { id: true, status: true }, where: { archived: false } },
+          },
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    res.json(accesses.map(a => ({
+      id: a.siteId,
+      role: a.role,
+      slug: a.site.slug,
+      name: a.site.name,
+      domain: a.site.domain,
+      teamName: a.site.team?.name,
+      totalReports: a.site.reports.length,
+    })));
+  } catch (err) {
+    captureError('shared boards error:', err);
+    res.status(500).json({ error: 'Failed to load shared boards' });
+  }
+});
+
+// ── End board sharing ───────────────────────────────────────────────────────────
+
 // Get all users who have access to a site
-app.get('/api/site/:slug/users', async (req, res) => {
+app.get('/api/site/:slug/users', authenticateToken, async (req, res) => {
   const { slug } = req.params;
 
   if (!slug) {
@@ -1895,14 +2768,13 @@ app.get('/api/site/:slug/users', async (req, res) => {
 
   try {
     const site = await prisma.site.findFirst({
-      where: { slug },
-      include: {
-        users: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-          },
+      where: { OR: [{ slug }, { domain: slug }] },
+      select: {
+        id: true,
+        teamId: true,
+        users: { select: { id: true, name: true, email: true } },
+        boardAccesses: {
+          select: { user: { select: { id: true, name: true, email: true } } },
         },
       },
     });
@@ -1911,9 +2783,34 @@ app.get('/api/site/:slug/users', async (req, res) => {
       return res.status(404).json({ error: 'Site not found' });
     }
 
-    res.json(site.users);
+    const hasAccess =
+      (site.teamId && (await prisma.teamMember.findFirst({ where: { teamId: site.teamId, userId: req.user.id } }))) ||
+      (await prisma.boardAccess.findUnique({ where: { siteId_userId: { siteId: site.id, userId: req.user.id } } }));
+    if (!hasAccess) return res.status(403).json({ error: 'Access denied' });
+
+    // Team members
+    const teamMembers = site.teamId
+      ? await prisma.teamMember.findMany({
+          where: { teamId: site.teamId },
+          select: { user: { select: { id: true, name: true, email: true } } },
+        })
+      : [];
+
+    // Merge: site.users + team members + board guests, deduplicated by id
+    const seen = new Set();
+    const all = [
+      ...site.users,
+      ...teamMembers.map((m) => m.user),
+      ...site.boardAccesses.map((a) => a.user),
+    ].filter((u) => {
+      if (seen.has(u.id)) return false;
+      seen.add(u.id);
+      return true;
+    });
+
+    res.json(all);
   } catch (error) {
-    console.error('Error fetching users for site:', error);
+    captureError('Error fetching users for site:', error);
     res.status(500).json({ error: 'Unable to fetch users for site' });
   }
 });
@@ -1947,22 +2844,68 @@ app.patch('/api/site/:slug/archive', authenticateToken, async (req, res) => {
       } for site "${slug}"`,
     });
   } catch (error) {
-    console.error('Failed to archive reports:', error);
+    captureError('Failed to archive reports:', error);
     res.status(500).json({ error: 'Failed to archive/unarchive reports' });
   }
 });
 
+// DELETE /api/site/:slug — permanently delete a site and all its reports
+app.delete('/api/site/:slug', authenticateToken, async (req, res) => {
+  const { slug } = req.params;
+  const userId = req.user.id;
+
+  try {
+    // Only the team owner (or the user who owns the reports) may delete
+    const site = await prisma.site.findFirst({
+      where: { OR: [{ slug }, { domain: slug }] },
+      select: { id: true, slug: true, teamId: true },
+    });
+
+    if (!site) return res.status(404).json({ error: 'Site not found' });
+
+    // M4 — live DB membership check instead of stale JWT team data
+    if (site.teamId) {
+      const isMember = await prisma.teamMember.findFirst({ where: { teamId: site.teamId, userId: req.user.id } });
+      if (!isMember) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+
+    // Run deletions sequentially outside a long-lived transaction to avoid
+    // FK RESTRICT conflicts (SiteUser) and implicit join-table issues (_SiteMembers).
+    // Each step is idempotent so partial failures leave the DB in a safe state.
+
+    // 1. Disconnect users from the site's implicit many-to-many (_SiteMembers)
+    await prisma.site.update({
+      where: { id: site.id },
+      data: { users: { set: [] } },
+    });
+
+    // 2. SiteUser (RESTRICT FK — must go before site delete)
+    await prisma.siteUser.deleteMany({ where: { siteId: site.id } });
+
+    // 3. QAReport → Comment (CASCADE) → Attachment (CASCADE)
+    await prisma.qAReport.deleteMany({ where: { siteId: site.id } });
+
+    // 4. Site — KanbanColumn, BoardAccess, BoardInvite, Notification all CASCADE or SET NULL
+    await prisma.site.delete({ where: { id: site.id } });
+
+    invalidateUserStats(userId);
+    invalidateUserSites(userId);
+    res.json({ message: 'Site deleted successfully' });
+  } catch (error) {
+    captureError('Error deleting site:', error);
+    res.status(500).json({ error: 'Failed to delete site' }); // H6 — removed internal detail
+  }
+});
+
 // GET /api/site/:slug/columns — return custom kanban columns for a site
-app.get('/api/site/:slug/columns', authenticateToken, async (req, res) => {
+app.get('/api/site/:slug/columns', authenticateToken, cacheMiddleware((req) => `columns:${req.params.slug}`, TTL.COLUMNS), async (req, res) => {
   const { slug } = req.params;
   const { teamId } = req.query;
 
-  if (!teamId) {
-    return res.status(400).json({ error: 'teamId is required' });
-  }
-
   try {
-    const site = await prisma.site.findFirst({ where: { slug, teamId } });
+    const site = await resolveSiteForUser(slug, teamId, req.user.id);
     if (!site) return res.status(404).json({ error: 'Site not found' });
 
     const columns = await prisma.kanbanColumn.findMany({
@@ -1973,7 +2916,7 @@ app.get('/api/site/:slug/columns', authenticateToken, async (req, res) => {
 
     res.json(columns.map((col) => ({ ...col, slug })));
   } catch (error) {
-    console.error('Failed to fetch columns:', error);
+    captureError('Failed to fetch columns:', error);
     res.status(500).json({ error: 'Failed to fetch columns' });
   }
 });
@@ -1991,7 +2934,7 @@ app.post('/api/site/:slug/columns', authenticateToken, async (req, res) => {
   }
 
   try {
-    const site = await prisma.site.findFirst({ where: { slug, teamId } });
+    const site = await resolveSiteForUser(slug, teamId, req.user.id);
     if (!site) return res.status(404).json({ error: 'Site not found' });
 
     const column = await prisma.kanbanColumn.create({
@@ -2000,9 +2943,10 @@ app.post('/api/site/:slug/columns', authenticateToken, async (req, res) => {
     });
 
     io.to(`site:${slug}`).emit('board:event', { type: 'column:created', column: { ...column, slug } });
+    invalidateSiteColumns(slug);
     res.status(201).json({ ...column, slug });
   } catch (error) {
-    console.error('Failed to create column:', error);
+    captureError('Failed to create column:', error);
     res.status(500).json({ error: 'Failed to create column' });
   }
 });
@@ -2017,7 +2961,7 @@ app.delete('/api/site/:slug/columns/:columnId', authenticateToken, async (req, r
   }
 
   try {
-    const site = await prisma.site.findFirst({ where: { slug, teamId } });
+    const site = await resolveSiteForUser(slug, teamId, req.user.id);
     if (!site) return res.status(404).json({ error: 'Site not found' });
 
     const column = await prisma.kanbanColumn.findFirst({
@@ -2036,9 +2980,10 @@ app.delete('/api/site/:slug/columns/:columnId', authenticateToken, async (req, r
     await prisma.kanbanColumn.delete({ where: { id: columnId } });
 
     io.to(`site:${slug}`).emit('board:event', { type: 'column:deleted', columnId });
+    invalidateSiteColumns(slug);
     res.json({ message: 'Column deleted' });
   } catch (error) {
-    console.error('Failed to delete column:', error);
+    captureError('Failed to delete column:', error);
     res.status(500).json({ error: 'Failed to delete column' });
   }
 });
@@ -2048,20 +2993,13 @@ app.get('/api/site/:slug/columns/order', authenticateToken, async (req, res) => 
   const { slug } = req.params;
   const { teamId } = req.query;
 
-  if (!teamId) {
-    return res.status(400).json({ error: 'teamId is required' });
-  }
-
   try {
-    const site = await prisma.site.findFirst({
-      where: { slug, teamId },
-      select: { columnOrder: true },
-    });
+    const site = await resolveSiteForUser(slug, teamId, req.user.id);
     if (!site) return res.status(404).json({ error: 'Site not found' });
 
     res.json({ order: site.columnOrder });
   } catch (error) {
-    console.error('Failed to fetch column order:', error);
+    captureError('Failed to fetch column order:', error);
     res.status(500).json({ error: 'Failed to fetch column order' });
   }
 });
@@ -2079,7 +3017,7 @@ app.patch('/api/site/:slug/columns/reorder', authenticateToken, async (req, res)
   }
 
   try {
-    const site = await prisma.site.findFirst({ where: { slug, teamId } });
+    const site = await resolveSiteForUser(slug, teamId, req.user.id);
     if (!site) return res.status(404).json({ error: 'Site not found' });
 
     await prisma.site.update({
@@ -2088,9 +3026,10 @@ app.patch('/api/site/:slug/columns/reorder', authenticateToken, async (req, res)
     });
 
     io.to(`site:${slug}`).emit('board:event', { type: 'column:reordered', order });
+    invalidateSiteColumns(slug);
     res.json({ order });
   } catch (error) {
-    console.error('Failed to save column order:', error);
+    captureError('Failed to save column order:', error);
     res.status(500).json({ error: 'Failed to save column order' });
   }
 });
@@ -2101,50 +3040,58 @@ app.get('/uploads', authenticateToken, async (req, res) => {
     const reports = await prisma.qAReport.findMany({
       where: { userId: userId },
       orderBy: { timestamp: 'desc' },
+      take: 500,
     });
     res.json(reports);
   } catch (error) {
-    console.error('Error fetching reports:', error);
+    captureError('Error fetching reports:', error);
     res.status(500).json({ error: 'Failed to fetch reports' });
   }
 });
 
-app.delete('/api/uploads', async (req, res) => {
-  const UPLOAD_DIR = path.join(__dirname, 'uploads');
-
+app.delete('/api/uploads', authenticateToken, async (req, res) => {
   try {
-    const files = await fs.promises.readdir(UPLOAD_DIR);
+    // Fetch only this user's reports that have local screenshot files
+    const reports = await prisma.qAReport.findMany({
+      where: { userId: req.user.id },
+      select: { id: true, screenshotUrl: true },
+    });
 
-    // Delete all files in the uploads directory
+    // Delete only files that belong to this user
+    const UPLOAD_DIR = path.join(__dirname, 'uploads');
     await Promise.all(
-      files.map((file) => fs.promises.unlink(path.join(UPLOAD_DIR, file))),
+      reports
+        .filter((r) => r.screenshotUrl)
+        .map(async (r) => {
+          const filename = path.basename(r.screenshotUrl);
+          const filePath = path.join(UPLOAD_DIR, filename);
+          try { await fs.promises.unlink(filePath); } catch { /* already gone */ }
+        }),
     );
 
-    // Optionally, also delete all entries in your database table
-    await prisma.qAReport.deleteMany();
+    await prisma.qAReport.deleteMany({ where: { userId: req.user.id } });
 
     await prisma.user.update({
       where: { id: req.user.id },
       data: { lastActive: new Date() },
     });
 
-    res.json({ message: 'All uploads and reports deleted successfully.' });
+    res.json({ message: 'Your uploads and reports have been deleted.' });
   } catch (error) {
-    console.error('Error deleting uploads:', error);
+    captureError('Error deleting uploads:', error);
     res.status(500).json({ error: 'Failed to delete uploads' });
   }
 });
 
-app.patch('/api/report/:id', async (req, res) => {
+app.patch('/api/report/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
 
   if (!status) return res.status(400).json({ error: 'Status is required' });
 
   try {
-    const existing = await prisma.qAReport.findUnique({ where: { id } });
-
-    if (!existing) return res.status(404).json({ error: 'Report not found' });
+    const existing = await assertReportAccess(id, req.user.id, res);
+    if (!existing) return;
 
     const updates = { status };
 
@@ -2163,21 +3110,24 @@ app.patch('/api/report/:id', async (req, res) => {
       data: updates,
     });
 
+    invalidateUserStats(req.user.id);
     res.json(updatedReport);
   } catch (error) {
-    console.error('Error updating report:', error);
+    captureError('Error updating report:', error);
     res.status(500).json({ error: 'Failed to update report' });
   }
 });
 
-app.get('/api/stats/open-issues', authenticateToken, async (req, res) => {
+app.get('/api/stats/open-issues', authenticateToken, cacheMiddleware((req) => `stats:open:${req.user.id}:${req.query.teamId || ''}`, TTL.STATS), async (req, res) => {
   const userId = req.user.id;
+  const { teamId } = req.query;
 
   try {
+    const siteDomains = await getTeamSiteDomains(userId, teamId);
     const openCount = await prisma.qAReport.count({
       where: {
         status: 'new',
-        userId,
+        site: { in: siteDomains },
         archived: false,
       },
     });
@@ -2188,18 +3138,20 @@ app.get('/api/stats/open-issues', authenticateToken, async (req, res) => {
     });
     res.json({ openIssues: openCount });
   } catch (error) {
-    console.error('Error fetching open issues:', error);
+    captureError('Error fetching open issues:', error);
     res.status(500).json({ error: 'Failed to fetch open issues count' });
   }
 });
 
-app.get('/api/stats/in-progress', authenticateToken, async (req, res) => {
+app.get('/api/stats/in-progress', authenticateToken, cacheMiddleware((req) => `stats:inprogress:${req.user.id}:${req.query.teamId || ''}`, TTL.STATS), async (req, res) => {
   const userId = req.user.id;
+  const { teamId } = req.query;
   try {
+    const siteDomains = await getTeamSiteDomains(userId, teamId);
     const inProgressCount = await prisma.qAReport.count({
       where: {
         status: 'inProgress',
-        userId,
+        site: { in: siteDomains },
         archived: false,
       },
     });
@@ -2210,18 +3162,20 @@ app.get('/api/stats/in-progress', authenticateToken, async (req, res) => {
     });
     res.json({ inProgressIssues: inProgressCount });
   } catch (error) {
-    console.error('Error fetching open issues:', error);
+    captureError('Error fetching open issues:', error);
     res.status(500).json({ error: 'Failed to fetch open issues count' });
   }
 });
 
-app.get('/api/stats/resolved', authenticateToken, async (req, res) => {
+app.get('/api/stats/resolved', authenticateToken, cacheMiddleware((req) => `stats:resolved:${req.user.id}:${req.query.teamId || ''}`, TTL.STATS), async (req, res) => {
   const userId = req.user.id;
+  const { teamId } = req.query;
   try {
+    const siteDomains = await getTeamSiteDomains(userId, teamId);
     const resolvedCount = await prisma.qAReport.count({
       where: {
         status: 'done',
-        userId,
+        site: { in: siteDomains },
         archived: false,
       },
     });
@@ -2232,61 +3186,77 @@ app.get('/api/stats/resolved', authenticateToken, async (req, res) => {
     });
     res.json({ resolvedIssues: resolvedCount });
   } catch (error) {
-    console.error('Error fetching open issues:', error);
+    captureError('Error fetching open issues:', error);
     res.status(500).json({ error: 'Failed to fetch open issues count' });
   }
 });
 
-app.get('/api/stats/issues-summary', authenticateToken, async (req, res) => {
+const ISSUE_SUMMARY_CUSTOM_COLORS = ['#a855f7', '#ec4899', '#14b8a6', '#f97316', '#06b6d4', '#84cc16'];
+
+app.get('/api/stats/issues-summary', authenticateToken, cacheMiddleware((req) => `stats:summary:${req.user.id}:${req.query.teamId || ''}`, TTL.STATS), async (req, res) => {
   const userId = req.user.id;
+  const { teamId } = req.query;
 
   try {
-    const [openCount, inProgressCount, doneCount] = await Promise.all([
-      prisma.qAReport.count({
-        where: { status: 'new', userId, archived: false },
+    const siteDomains = await getTeamSiteDomains(userId, teamId);
+
+    // Group by status so custom columns (status = a KanbanColumn id) aren't silently dropped
+    const [grouped, sites] = await Promise.all([
+      prisma.qAReport.groupBy({
+        by: ['status'],
+        where: { site: { in: siteDomains }, archived: false },
+        _count: { status: true },
       }),
-      prisma.qAReport.count({
-        where: { status: 'inProgress', userId, archived: false },
-      }),
-      prisma.qAReport.count({
-        where: { status: 'done', userId, archived: false },
-      }),
+      prisma.site.findMany({ where: { domain: { in: siteDomains } }, select: { id: true } }),
     ]);
 
-    const total = openCount + inProgressCount + doneCount || 1; // prevent division by zero
+    const siteIds = sites.map((s) => s.id);
+    const customColumns = siteIds.length
+      ? await prisma.kanbanColumn.findMany({
+          where: { siteId: { in: siteIds } },
+          select: { id: true, name: true },
+        })
+      : [];
+    const columnNameById = new Map(customColumns.map((c) => [c.id, c.name]));
 
-    // calculate initial percentages
-    let openPct = (openCount / total) * 100;
-    let inProgressPct = (inProgressCount / total) * 100;
-    let donePct = (doneCount / total) * 100;
+    const countByStatus = new Map(grouped.map((g) => [g.status, g._count.status]));
+    const openCount = countByStatus.get('new') || 0;
+    const inProgressCount = countByStatus.get('inProgress') || 0;
+    const doneCount = countByStatus.get('done') || 0;
 
-    // round to 1 decimal
-    openPct = Math.round(openPct * 10) / 10;
-    inProgressPct = Math.round(inProgressPct * 10) / 10;
-    donePct = Math.round(donePct * 10) / 10;
-
-    // adjust to ensure sum = 100
-    const sumPct = openPct + inProgressPct + donePct;
-    const diff = 100 - sumPct;
-
-    if (diff !== 0) {
-      // add difference to the largest value
-      const maxPct = Math.max(openPct, inProgressPct, donePct);
-      if (maxPct === openPct) openPct += diff;
-      else if (maxPct === inProgressPct) inProgressPct += diff;
-      else donePct += diff;
+    // Anything left over is either a known custom column or an orphaned/deleted one
+    const customEntries = [];
+    let colorIndex = 0;
+    for (const [status, count] of countByStatus) {
+      if (status === 'new' || status === 'inProgress' || status === 'done') continue;
+      const name = columnNameById.get(status) || 'Other';
+      const existing = customEntries.find((e) => e.name === name);
+      if (existing) {
+        existing.value += count;
+      } else {
+        customEntries.push({ name, value: count, color: ISSUE_SUMMARY_CUSTOM_COLORS[colorIndex % ISSUE_SUMMARY_CUSTOM_COLORS.length] });
+        colorIndex++;
+      }
     }
 
-    const issuesSummary = [
-      { name: 'Open', value: openCount, percentage: openPct, color: '#60A5FA' },
-      {
-        name: 'In Progress',
-        value: inProgressCount,
-        percentage: inProgressPct,
-        color: '#FBBF24',
-      },
-      { name: 'Done', value: doneCount, percentage: donePct, color: '#34D399' },
+    const counts = [
+      { name: 'Open', value: openCount, color: '#60A5FA' },
+      { name: 'In Progress', value: inProgressCount, color: '#FBBF24' },
+      { name: 'Done', value: doneCount, color: '#34D399' },
+      ...customEntries,
     ];
+
+    const total = counts.reduce((sum, c) => sum + c.value, 0) || 1; // prevent division by zero
+
+    // round to 1 decimal, then nudge the largest bucket so percentages sum to exactly 100
+    let pcts = counts.map((c) => Math.round(((c.value / total) * 100) * 10) / 10);
+    const diff = 100 - pcts.reduce((s, p) => s + p, 0);
+    if (diff !== 0) {
+      const maxIdx = pcts.indexOf(Math.max(...pcts));
+      pcts[maxIdx] = Math.round((pcts[maxIdx] + diff) * 10) / 10;
+    }
+
+    const issuesSummary = counts.map((c, i) => ({ ...c, percentage: pcts[i] }));
 
     await prisma.user.update({
       where: { id: req.user.id },
@@ -2295,22 +3265,24 @@ app.get('/api/stats/issues-summary', authenticateToken, async (req, res) => {
 
     res.json(issuesSummary);
   } catch (error) {
-    console.error('Error fetching issues summary:', error);
+    captureError('Error fetching issues summary:', error);
     res.status(500).json({ error: 'Failed to fetch issues summary' });
   }
 });
 
 // GET /api/stats/reports-this-week
-app.get('/api/stats/reports-this-week', authenticateToken, async (req, res) => {
+app.get('/api/stats/reports-this-week', authenticateToken, cacheMiddleware((req) => `stats:weekly:${req.user.id}:${req.query.teamId || ''}`, TTL.STATS), async (req, res) => {
   const userId = req.user.id;
+  const { teamId } = req.query;
   try {
+    const siteDomains = await getTeamSiteDomains(userId, teamId);
     const startOfWeek = new Date();
     startOfWeek.setUTCHours(0, 0, 0, 0);
     startOfWeek.setUTCDate(startOfWeek.getUTCDate() - startOfWeek.getUTCDay()); // Sunday
 
     const count = await prisma.qAReport.count({
       where: {
-        userId,
+        site: { in: siteDomains },
         archived: false,
         timestamp: {
           gte: startOfWeek,
@@ -2325,7 +3297,7 @@ app.get('/api/stats/reports-this-week', authenticateToken, async (req, res) => {
 
     res.json({ reportsThisWeek: count });
   } catch (error) {
-    console.error('Error fetching weekly report count:', error);
+    captureError('Error fetching weekly report count:', error);
     res.status(500).json({ error: 'Failed to fetch reports this week' });
   }
 });
@@ -2334,12 +3306,15 @@ app.get('/api/stats/reports-this-week', authenticateToken, async (req, res) => {
 app.get(
   '/api/stats/avg-resolution-time',
   authenticateToken,
+  cacheMiddleware((req) => `stats:avgresolution:${req.user.id}:${req.query.teamId || ''}`, TTL.STATS),
   async (req, res) => {
     const userId = req.user.id;
+    const { teamId } = req.query;
     try {
+      const siteDomains = await getTeamSiteDomains(userId, teamId);
       const reports = await prisma.qAReport.findMany({
         where: {
-          userId,
+          site: { in: siteDomains },
           status: 'resolved',
           archived: false,
           resolvedAt: {
@@ -2370,13 +3345,40 @@ app.get(
 
       res.json({ avgResolutionTimeHours: avgHours });
     } catch (error) {
-      console.error('Error calculating avg resolution time:', error);
+      captureError('Error calculating avg resolution time:', error);
       res
         .status(500)
         .json({ error: 'Failed to calculate average resolution time' });
     }
   },
 );
+
+// PATCH /api/report/:id/description — update the report description/comment
+app.patch('/api/report/:id/description', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { comment } = req.body;
+  if (comment === undefined) return res.status(400).json({ error: 'comment is required' });
+  try {
+    const access = await assertReportAccess(id, req.user.id, res);
+    if (!access) return;
+    const updated = await prisma.qAReport.update({
+      where: { id },
+      data: { comment },
+      include: { Site: { select: { slug: true } } },
+    });
+    if (updated.Site?.slug) {
+      io.to(`site:${updated.Site.slug}`).emit('board:event', {
+        type: 'report:updated',
+        reportId: id,
+        comment,
+      });
+    }
+    res.json({ comment: updated.comment });
+  } catch (error) {
+    captureError('Failed to update description:', error);
+    res.status(500).json({ error: 'Failed to update description' });
+  }
+});
 
 // PATCH /api/report/:id/due-date
 app.patch('/api/report/:id/due-date', authenticateToken, async (req, res) => {
@@ -2391,13 +3393,8 @@ app.patch('/api/report/:id/due-date', authenticateToken, async (req, res) => {
   }
 
   try {
-    const existing = await prisma.qAReport.findUnique({
-      where: { id },
-    });
-
-    if (!existing) {
-      return res.status(404).json({ error: 'Report not found' });
-    }
+    const existing = await assertReportAccess(id, req.user.id, res);
+    if (!existing) return;
 
     const updatedReport = await prisma.qAReport.update({
       where: { id },
@@ -2427,7 +3424,7 @@ app.patch('/api/report/:id/due-date', authenticateToken, async (req, res) => {
 
     res.json(updatedReport);
   } catch (error) {
-    console.error('Failed to update due date:', error);
+    captureError('Failed to update due date:', error);
     res.status(500).json({ error: 'Failed to update due date' });
   }
 });
@@ -2438,6 +3435,8 @@ app.patch('/api/report/:id/status', authenticateToken, async (req, res) => {
   const { status } = req.body;
 
   try {
+    const access = await assertReportAccess(id, req.user.id, res);
+    if (!access) return;
     const updated = await prisma.qAReport.update({
       where: { id },
       data: { status },
@@ -2466,16 +3465,20 @@ app.patch('/api/report/:id/status', authenticateToken, async (req, res) => {
 
     res.json(updated);
   } catch (error) {
-    console.error('Failed to update status:', error);
+    captureError('Failed to update status:', error);
     res.status(500).json({ error: 'Failed to update status' });
   }
 });
 
 // GET /api/report/:id/status
-app.get('/api/report/:id/status', async (req, res) => {
+app.get('/api/report/:id/status', authenticateToken, async (req, res) => {
   const { id } = req.params;
 
   try {
+    // M2 — ownership check
+    const access = await assertReportAccess(id, req.user.id, res);
+    if (!access) return;
+
     const report = await prisma.qAReport.findUnique({
       where: { id },
       select: { status: true }, // Only fetch the 'status' field
@@ -2487,8 +3490,74 @@ app.get('/api/report/:id/status', async (req, res) => {
 
     res.json(report); // will return { status: "some_status" }
   } catch (error) {
-    console.error('Failed to get status:', error);
+    captureError('Failed to get status:', error);
     res.status(500).json({ error: 'Failed to get status' });
+  }
+});
+
+// PATCH /api/report/:id/assignee — reassign a task to another team/board member
+app.patch('/api/report/:id/assignee', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { userId, userName } = req.body;
+
+  if (!userId || !userName) {
+    return res.status(400).json({ error: 'userId and userName are required' });
+  }
+
+  try {
+    const access = await assertReportAccess(id, req.user.id, res);
+    if (!access) return;
+    const updated = await prisma.qAReport.update({
+      where: { id },
+      data: { userId, userName },
+      include: { Site: { select: { slug: true } } },
+    });
+
+    // Notify the newly assigned user (if it's not the person doing the reassigning)
+    if (userId !== req.user.id) {
+      await logActivity({
+        userId,                  // the new assignee
+        actorId: req.user.id,
+        type: 'assignment',
+        reportId: id,
+        message: `${req.user.name} assigned you a task`,
+      });
+
+      const assignee = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { notificationPrefs: true },
+      });
+      const prefs = assignee?.notificationPrefs;
+      if (!prefs || prefs.taskAssigned !== false) {
+        await prisma.notification.create({
+          data: {
+            userId,
+            type: 'TASK_ASSIGNED',
+            message: `${req.user.name} assigned you "${updated.title}"`,
+            reportId: id,
+          },
+        });
+      }
+    }
+
+    await prisma.user.update({
+      where: { id: req.user.id },
+      data: { lastActive: new Date() },
+    });
+
+    if (updated.Site?.slug) {
+      io.to(`site:${updated.Site.slug}`).emit('board:event', {
+        type: 'report:assignee',
+        reportId: id,
+        userId,
+        userName,
+      });
+    }
+
+    res.json({ userId: updated.userId, userName: updated.userName });
+  } catch (error) {
+    captureError('Failed to update assignee:', error);
+    res.status(500).json({ error: 'Failed to update assignee' });
   }
 });
 
@@ -2505,13 +3574,8 @@ app.patch('/api/report/:id/priority', authenticateToken, async (req, res) => {
   }
 
   try {
-    const existing = await prisma.qAReport.findUnique({
-      where: { id },
-    });
-
-    if (!existing) {
-      return res.status(404).json({ error: 'Report not found' });
-    }
+    const existing = await assertReportAccess(id, req.user.id, res);
+    if (!existing) return;
 
     const updatedReport = await prisma.qAReport.update({
       where: { id },
@@ -2535,18 +3599,55 @@ app.patch('/api/report/:id/priority', authenticateToken, async (req, res) => {
       data: { lastActive: new Date() },
     });
 
+    // Notify all clients on this board so priority changes are reflected live
+    if (updatedReport.siteId) {
+      const site = await prisma.site.findUnique({ where: { id: updatedReport.siteId }, select: { slug: true } });
+      if (site?.slug) {
+        io.to(`site:${site.slug}`).emit('board:event', { type: 'report:updated', reportId: id, priority });
+      }
+    }
+
     res.json(updatedReport);
   } catch (error) {
-    console.error('Error updating priority:', error);
+    captureError('Error updating priority:', error);
     res.status(500).json({ error: 'Failed to update priority' });
   }
 });
 
-// GET /api/report/:id/status
-app.get('/api/report/:id/priority', async (req, res) => {
+// PATCH /api/report/:id/type
+app.patch('/api/report/:id/type', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { type } = req.body;
+
+  const allowed = ['bug', 'suggestion', 'task'];
+  if (!type || !allowed.includes(type)) {
+    return res.status(400).json({ error: `Type must be one of: ${allowed.join(', ')}` });
+  }
+
+  try {
+    const existing = await assertReportAccess(id, req.user.id, res);
+    if (!existing) return;
+
+    const updatedReport = await prisma.qAReport.update({ where: { id }, data: { type } });
+
+    await prisma.user.update({ where: { id: req.user.id }, data: { lastActive: new Date() } });
+
+    res.json(updatedReport);
+  } catch (error) {
+    captureError('Error updating type:', error);
+    res.status(500).json({ error: 'Failed to update type' });
+  }
+});
+
+// GET /api/report/:id/priority
+app.get('/api/report/:id/priority', authenticateToken, async (req, res) => {
   const { id } = req.params;
 
   try {
+    // M2 — ownership check
+    const access = await assertReportAccess(id, req.user.id, res);
+    if (!access) return;
+
     const report = await prisma.qAReport.findUnique({
       where: { id },
       select: { priority: true }, // Only fetch the 'priority' field
@@ -2556,9 +3657,9 @@ app.get('/api/report/:id/priority', async (req, res) => {
       return res.status(404).json({ error: 'Report not found' });
     }
 
-    res.json(report); // will return { priority: "some_status" }
+    res.json(report);
   } catch (error) {
-    console.error('Failed to get priority:', error);
+    captureError('Failed to get priority:', error);
     res.status(500).json({ error: 'Failed to get priority' });
   }
 });
@@ -2570,20 +3671,29 @@ app.post(
   uploadAttachments.array('attachments', 10),
   async (req, res) => {
     const { reportId } = req.params;
-    const { content, parentId } = req.body;
+    const { content, parentId, mentionedUserIds: rawMentionedIds } = req.body;
+    // mentionedUserIds may come as a single string or array from FormData
+    const explicitMentions = rawMentionedIds
+      ? Array.isArray(rawMentionedIds) ? rawMentionedIds : [rawMentionedIds]
+      : [];
     const attachments = req.files;
 
     if (!reportId || !content) {
-      return res
-        .status(400)
-        .json({ error: 'reportId and content are required' });
+      return res.status(400).json({ error: 'reportId and content are required' });
     }
+    if (content.length > 5000) {
+      return res.status(400).json({ error: 'Comment must be 5000 characters or fewer' });
+    }
+
+    const access = await assertReportAccess(reportId, req.user.id, res);
+    if (!access) return;
 
     try {
       const uploadedAttachments = attachments?.length
         ? await Promise.all(
             attachments.map(async (file) => {
-              const fileKey = `comments/${Date.now()}_${file.originalname}`;
+              const sanitisedAttachName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_'); // M5
+              const fileKey = `comments/${Date.now()}_${sanitisedAttachName}`;
 
               // upload original
               await uploadBufferToR2(file.buffer, fileKey, file.mimetype);
@@ -2638,15 +3748,23 @@ app.post(
         },
       });
 
-      await prisma.notification.create({
-        data: {
-          userId: req.user.id,
-          type: 'MENTION',
-          commentId: comment.id,
-          reportId: comment.reportId,
-          message: `${req.user.name} mentioned you in a comment`,
-        },
-      });
+      // Notify all mentioned users (explicit list sent from client)
+      const toNotify = [...new Set(explicitMentions)].filter((uid) => uid !== req.user.id);
+      if (toNotify.length > 0) {
+        await Promise.all(
+          toNotify.map((mentionedUserId) =>
+            prisma.notification.create({
+              data: {
+                userId: mentionedUserId,
+                type: 'MENTION',
+                commentId: comment.id,
+                reportId: comment.reportId,
+                message: `${req.user.name} mentioned you in a comment`,
+              },
+            })
+          )
+        );
+      }
 
       await prisma.user.update({
         where: { id: req.user.id },
@@ -2655,7 +3773,7 @@ app.post(
 
       res.json(comment);
     } catch (error) {
-      console.error(error);
+      captureError(error);
       res
         .status(500)
         .json({ error: 'Unable to create comment with attachments' });
@@ -2664,8 +3782,11 @@ app.post(
 );
 
 // Retrieve comments with attachments for a report
-app.get('/api/reports/:reportId/comments', async (req, res) => {
+app.get('/api/reports/:reportId/comments', authenticateToken, async (req, res) => {
   const { reportId } = req.params;
+
+  const access = await assertReportAccess(reportId, req.user.id, res);
+  if (!access) return;
 
   try {
     const comments = await prisma.comment.findMany({
@@ -2705,20 +3826,26 @@ app.get('/api/reports/:reportId/comments', async (req, res) => {
 
     res.json(withSignedUrls);
   } catch (error) {
-    console.error(error);
+    captureError(error);
     res.status(500).json({ error: 'Unable to fetch comments' });
   }
 });
 
-app.delete('/api/report/:id', async (req, res) => {
+app.delete('/api/report/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
 
+  // C1 — ownership check before deletion
+  const access = await assertReportAccess(id, req.user.id, res);
+  if (!access) return;
+
   try {
+    let deletedSiteSlug = null;
+
     await prisma.$transaction(async (tx) => {
       // Get report incl. site id + image path
       const report = await tx.qAReport.findUnique({
         where: { id },
-        select: { id: true, siteId: true, imagePath: true },
+        select: { id: true, siteId: true, imagePath: true, Site: { select: { slug: true } } },
       });
 
       if (!report) {
@@ -2726,11 +3853,14 @@ app.delete('/api/report/:id', async (req, res) => {
       }
 
       const { siteId, imagePath } = report;
+      deletedSiteSlug = report.Site?.slug ?? null;
 
       // ---- FILE CLEANUP ----
       if (imagePath) {
         const abs = path.join(__dirname, imagePath);
-        if (fs.existsSync(abs)) fs.unlinkSync(abs);
+        // C2 — path traversal guard: only delete files within the uploads directory
+        const uploadsDir = path.join(__dirname, 'uploads');
+        if (abs.startsWith(uploadsDir) && fs.existsSync(abs)) fs.unlinkSync(abs);
       }
 
       const metadataPath = path.join(__dirname, 'uploads', `${id}.json`);
@@ -2751,15 +3881,35 @@ app.delete('/api/report/:id', async (req, res) => {
       }
     });
 
+    if (deletedSiteSlug) {
+      io.to(`site:${deletedSiteSlug}`).emit('board:event', { type: 'report:deleted', reportId: id });
+    }
+
+    invalidateUserStats(req.user.id);
+    invalidateUserSites(req.user.id);
     res.json({ message: 'Report deleted successfully' });
   } catch (error) {
     if (error instanceof Error && error.message === 'REPORT_NOT_FOUND') {
       return res.status(404).json({ error: 'Report not found' });
     }
 
-    console.error('Error deleting report:', error);
+    captureError('Error deleting report:', error);
     res.status(500).json({ error: 'Failed to delete report' });
   }
+});
+
+// Returns canonical plan limits — frontend uses this as single source of truth
+app.get('/api/plan-limits', (req, res) => {
+  // Replace Infinity with null so JSON serialisation works
+  const serialisable = Object.fromEntries(
+    Object.entries(PLAN_LIMITS).map(([plan, limits]) => [
+      plan,
+      Object.fromEntries(
+        Object.entries(limits).map(([k, v]) => [k, v === Infinity ? null : v])
+      ),
+    ])
+  );
+  res.json(serialisable);
 });
 
 app.get('/api/team/:teamId/stats', authenticateToken, async (req, res) => {
@@ -2817,7 +3967,7 @@ app.get('/api/team/:teamId/stats', authenticateToken, async (req, res) => {
       teamMembersCount: teamStats._count.members,
     });
   } catch (err) {
-    console.error(err);
+    captureError(err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -2847,7 +3997,21 @@ app.get('/api/teams', authenticateToken, async (req, res) => {
 });
 
 app.post('/billing/checkout', authenticateToken, async (req, res) => {
+  try {
   const { teamId, priceId } = req.body;
+
+  // L1 — validate priceId against known env-var price IDs (allow null/undefined for free downgrade)
+  const allowedPriceIds = [
+    process.env.PRICE_FREE_MONTHLY,
+    process.env.PRICE_FREE_YEARLY,
+    process.env.PRICE_STARTER_MONTHLY,
+    process.env.PRICE_STARTER_YEARLY,
+    process.env.PRICE_TEAM_MONTHLY,
+    process.env.PRICE_TEAM_YEARLY,
+  ].filter(Boolean);
+  if (priceId && !allowedPriceIds.includes(priceId)) {
+    return res.status(400).json({ error: 'Invalid price' });
+  }
 
   const team = await prisma.team.findUnique({
     where: { id: teamId },
@@ -2861,6 +4025,25 @@ app.post('/billing/checkout', authenticateToken, async (req, res) => {
 
   if (!isOwner)
     return res.status(403).json({ error: 'Only team owners can upgrade' });
+
+  const targetPlan = mapPriceToPlan(priceId);
+
+  // ⭐ DOWNGRADE TO FREE → cancel the active subscription immediately
+  if (targetPlan === 'free') {
+    if (team.subscription?.stripeSubscriptionId) {
+      try {
+        await stripe.subscriptions.cancel(team.subscription.stripeSubscriptionId);
+      } catch (err) {
+        if (err?.code !== 'resource_missing') throw err;
+      }
+    }
+    await prisma.subscription.update({
+      where: { teamId },
+      data: { plan: 'free', status: 'canceled', stripeSubscriptionId: null, stripePriceId: null },
+    });
+    await prisma.team.update({ where: { id: teamId }, data: { plan: 'free' } });
+    return res.json({ status: 'updated' });
+  }
 
   // Create customer if missing
   let customerId = team.stripeCustomerId;
@@ -2879,27 +4062,45 @@ app.post('/billing/checkout', authenticateToken, async (req, res) => {
     });
   }
 
-  const plan = mapPriceToPlan(priceId);
+  const plan = targetPlan;
 
   // ⭐ EXISTING SUBSCRIPTION → UPDATE PLAN IN STRIPE (NO NEW SUB)
   if (team.subscription?.stripeSubscriptionId) {
-    await stripe.subscriptions.update(team.subscription.stripeSubscriptionId, {
-      items: [
-        {
-          id: team.subscription.stripePriceId, // subscription item id
-          price: priceId,
-        },
-      ],
-      proration_behavior: 'create_prorations',
-    });
+    let stripeSub = null;
+    try {
+      // Retrieve the live subscription to get the subscription item ID (si_...)
+      stripeSub = await stripe.subscriptions.retrieve(team.subscription.stripeSubscriptionId);
+    } catch (err) {
+      if (err?.code === 'resource_missing') {
+        // Stale subscription ID in DB — clear it and fall through to checkout
+        await prisma.subscription.update({
+          where: { teamId },
+          data: { stripeSubscriptionId: null, stripePriceId: null, status: 'canceled' },
+        });
+      } else {
+        throw err;
+      }
+    }
 
-    await prisma.team.update({
-      where: { id: teamId },
-      include: { subscription: true },
-      data: { plan },
-    });
+    if (stripeSub) {
+      const itemId = stripeSub.items.data[0]?.id;
+      if (!itemId) return res.status(400).json({ error: 'No subscription item found' });
 
-    return res.json({ status: 'updated' });
+      await stripe.subscriptions.update(team.subscription.stripeSubscriptionId, {
+        items: [{ id: itemId, price: priceId }],
+        proration_behavior: 'create_prorations',
+      });
+
+      await prisma.subscription.update({
+        where: { teamId },
+        data: { plan, stripePriceId: priceId },
+      });
+
+      await prisma.team.update({ where: { id: teamId }, data: { plan } });
+
+      return res.json({ status: 'updated' });
+    }
+    // stripeSub was null (stale ID cleared) → fall through to checkout below
   }
 
   // ⭐ NO SUBSCRIPTION → CREATE VIA CHECKOUT
@@ -2907,8 +4108,8 @@ app.post('/billing/checkout', authenticateToken, async (req, res) => {
     mode: 'subscription',
     customer: customerId,
     line_items: [{ price: priceId, quantity: 1 }],
-    success_url: `${process.env.APP_URL}/billing/success?team=${teamId}`,
-    cancel_url: `${process.env.APP_URL}/billing/cancelled`,
+    success_url: `${process.env.APP_URL}/usage-billing?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${process.env.APP_URL}/usage-billing`,
     subscription_data: {
       metadata: { teamId },
     },
@@ -2916,10 +4117,75 @@ app.post('/billing/checkout', authenticateToken, async (req, res) => {
   });
 
   res.json({ url: session.url });
+  } catch (err) {
+    captureError('Billing checkout error:', err);
+    res.status(500).json({ error: err?.message ?? 'Checkout failed' });
+  }
+});
+
+// GET /billing/verify-session?sessionId=cs_... — confirm checkout and write plan to DB
+// Used as a fallback for local dev where webhooks can't reach localhost.
+app.get('/billing/verify-session', authenticateToken, async (req, res) => {
+  const { sessionId } = req.query;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['subscription', 'subscription.items.data.price'],
+    });
+
+    if (session.payment_status !== 'paid' && session.status !== 'complete') {
+      return res.status(402).json({ error: 'Payment not completed' });
+    }
+
+    const sub = session.subscription;
+    if (!sub) return res.status(400).json({ error: 'No subscription on session' });
+
+    const teamId = session.metadata?.teamId;
+    if (!teamId) return res.status(400).json({ error: 'No teamId in session metadata' });
+
+    // L2 — verify caller is an owner of the team in the session metadata
+    const isOwner = await prisma.teamMember.findFirst({ where: { teamId, userId: req.user.id, role: 'owner' } });
+    if (!isOwner) return res.status(403).json({ error: 'Access denied' });
+
+    const priceId = sub.items.data[0].price.id;
+    const plan = mapPriceToPlan(priceId);
+
+    await prisma.subscription.upsert({
+      where: { teamId },
+      update: {
+        plan,
+        interval: sub.items.data[0].price.recurring.interval,
+        status: sub.status,
+        stripeCustomerId: typeof sub.customer === 'string' ? sub.customer : sub.customer?.id,
+        stripeSubscriptionId: sub.id,
+        stripePriceId: priceId,
+        currentPeriodEnd: sub.current_period_end ? new Date(sub.current_period_end * 1000) : null,
+        teamId,
+      },
+      create: {
+        teamId,
+        plan,
+        interval: sub.items.data[0].price.recurring.interval,
+        status: sub.status,
+        stripeCustomerId: typeof sub.customer === 'string' ? sub.customer : sub.customer?.id,
+        stripeSubscriptionId: sub.id,
+        stripePriceId: priceId,
+        currentPeriodEnd: sub.current_period_end ? new Date(sub.current_period_end * 1000) : null,
+      },
+    });
+
+    await prisma.team.update({ where: { id: teamId }, data: { plan } });
+
+    res.json({ plan });
+  } catch (err) {
+    captureError('verify-session error:', err);
+    res.status(500).json({ error: err?.message ?? 'Verification failed' });
+  }
 });
 
 // GET /api/search?q=keyword
-app.get('/api/search', authenticateToken, async (req, res) => {
+app.get('/api/search', authenticateToken, searchLimiter, cacheMiddleware((req) => `search:${req.user.id}:${req.query.q}`, TTL.SEARCH), async (req, res) => {
   const { q } = req.query;
   if (!q || q.length < 1)
     return res.json({ projects: [], issues: [], users: [] });
@@ -2930,8 +4196,8 @@ app.get('/api/search', authenticateToken, async (req, res) => {
     // Search Projects (Sites)
     const projects = await prisma.site.findMany({
       where: {
-        name: { contains: keyword },
-        users: { some: { id: req.user.id } }, // only accessible projects
+        name: { contains: keyword, mode: 'insensitive' },
+        users: { some: { id: req.user.id } },
       },
       select: { id: true, name: true, slug: true },
       take: 10,
@@ -2942,8 +4208,8 @@ app.get('/api/search', authenticateToken, async (req, res) => {
     const issues = await prisma.qAReport.findMany({
       where: {
         OR: [
-          { comment: { contains: keyword } },
-          { siteName: { contains: keyword } },
+          { comment: { contains: keyword, mode: 'insensitive' } },
+          { siteName: { contains: keyword, mode: 'insensitive' } },
         ],
         userId: req.user.id,
         archived: false,
@@ -2952,10 +4218,18 @@ app.get('/api/search', authenticateToken, async (req, res) => {
       take: 10,
     });
 
-    // Search Users
+    // Search Users — M3: scope to members of teams the authenticated user belongs to
+    const memberships = await prisma.teamMember.findMany({ where: { userId: req.user.id }, select: { teamId: true } });
+    const teamIds = memberships.map((m) => m.teamId);
+    const teamUserIds = await prisma.teamMember.findMany({ where: { teamId: { in: teamIds } }, select: { userId: true } });
+    const scopedIds = [...new Set(teamUserIds.map((m) => m.userId))];
     const users = await prisma.user.findMany({
       where: {
-        OR: [{ name: { contains: keyword } }, { email: { contains: keyword } }],
+        id: { in: scopedIds },
+        OR: [
+          { name: { contains: keyword, mode: 'insensitive' } },
+          { email: { contains: keyword, mode: 'insensitive' } },
+        ],
       },
       select: { id: true, name: true, email: true },
       take: 10,
@@ -2963,34 +4237,26 @@ app.get('/api/search', authenticateToken, async (req, res) => {
 
     res.json({ projects, issues, users });
   } catch (error) {
-    console.error('Search error:', error);
+    captureError('Search error:', error);
     res.status(500).json({ error: 'Failed to perform search' });
   }
 });
 
 app.get('/api/invoices', authenticateToken, async (req, res) => {
   try {
-    // Get the user's team
     const teamMember = await prisma.teamMember.findFirst({
       where: { userId: req.user.id },
       include: { team: true },
     });
 
-    if (!teamMember || !teamMember.team.stripeCustomerId) {
-      return res
-        .status(400)
-        .json({ error: 'No Stripe customer linked to this team' });
+    if (!teamMember?.team?.stripeCustomerId) {
+      return res.json([]); // no Stripe customer yet — return empty list
     }
 
     const customerId = teamMember.team.stripeCustomerId;
 
-    // Fetch invoices from Stripe
-    const invoices = await stripe.invoices.list({
-      customer: customerId,
-      limit: 20, // adjust as needed
-    });
+    const invoices = await stripe.invoices.list({ customer: customerId, limit: 20 });
 
-    // Optionally, you can map the data to only return what you need
     const formattedInvoices = invoices.data.map((inv) => ({
       id: inv.id,
       number: inv.number,
@@ -2998,47 +4264,74 @@ app.get('/api/invoices', authenticateToken, async (req, res) => {
       status: inv.status,
       created: inv.created,
       invoice_pdf: inv.invoice_pdf,
-      number: inv.number,
       subscription: inv.subscription,
     }));
 
-    console.log(formattedInvoices);
-
     res.json(formattedInvoices);
   } catch (error) {
-    console.error('Error fetching invoices:', error);
+    captureError('Error fetching invoices:', error);
+    // Customer not found in Stripe (test/live mode mismatch) — return empty list
+    if (error?.type === 'StripeInvalidRequestError') {
+      return res.json([]);
+    }
     res.status(500).json({ error: 'Failed to fetch invoices' });
   }
 });
 
-app.get('/billing/next-renewal/:subscriptionId', async (req, res) => {
+app.get('/billing/next-renewal/:subscriptionId', authenticateToken, async (req, res) => {
   try {
     const { subscriptionId } = req.params;
 
-    const subscription = await stripe.subscriptions.retrieve(subscriptionId, {
-      expand: ['latest_invoice'],
+    // Read from DB — currentPeriodEnd is synced via webhook on every renewal
+    const dbSub = await prisma.subscription.findFirst({
+      where: { stripeSubscriptionId: subscriptionId },
+      select: { currentPeriodEnd: true, interval: true, createdAt: true },
     });
 
-    let nextUnix;
-
-    if (subscription.current_period_end) {
-      nextUnix = subscription.current_period_end;
-    } else if (subscription.latest_invoice?.lines?.data?.[0]?.period?.end) {
-      nextUnix = subscription.latest_invoice.lines.data[0].period.end;
-    } else {
-      const anchor = subscription.billing_cycle_anchor;
-      const interval = subscription.plan.interval;
-      const count = subscription.plan.interval_count || 1;
-
-      const date = new Date(anchor * 1000);
-      if (interval === 'month') date.setMonth(date.getMonth() + count);
-      if (interval === 'year') date.setFullYear(date.getFullYear() + count);
-
-      nextUnix = Math.floor(date.getTime() / 1000);
+    if (!dbSub) {
+      return res.status(404).json({ error: 'Subscription not found' });
     }
 
-    const nextDate = new Date(nextUnix * 1000);
+    let nextDate;
 
+    if (dbSub.currentPeriodEnd) {
+      // Best case: webhook has kept this up to date
+      nextDate = new Date(dbSub.currentPeriodEnd);
+    } else {
+      // currentPeriodEnd not in DB — try Stripe first, then calculate locally
+      try {
+        const stripeSub = await stripe.subscriptions.retrieve(subscriptionId);
+        if (stripeSub.current_period_end) {
+          nextDate = new Date(stripeSub.current_period_end * 1000);
+          // Backfill so future requests skip Stripe
+          await prisma.subscription.updateMany({
+            where: { stripeSubscriptionId: subscriptionId },
+            data: { currentPeriodEnd: nextDate },
+          });
+        }
+      } catch {
+        // Stripe unavailable or sub not found there — fall through to local calculation
+      }
+
+      if (!nextDate) {
+        // Calculate from billing cycle anchor (createdAt) + interval
+        const anchor = new Date(dbSub.createdAt);
+        const interval = dbSub.interval || 'month';
+        const now = new Date();
+
+        // Advance anchor by full billing periods until we're in the future
+        nextDate = new Date(anchor);
+        while (nextDate <= now) {
+          if (interval === 'year') {
+            nextDate.setFullYear(nextDate.getFullYear() + 1);
+          } else {
+            nextDate.setMonth(nextDate.getMonth() + 1);
+          }
+        }
+      }
+    }
+
+    const nextUnix = Math.floor(nextDate.getTime() / 1000);
     const formattedDate = nextDate.toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'long',
@@ -3047,45 +4340,105 @@ app.get('/billing/next-renewal/:subscriptionId', async (req, res) => {
 
     return res.json({
       subscriptionId,
-      nextBillingDateFormatted: formattedDate, // 👉 January 21, 2026
+      nextBillingDateFormatted: formattedDate,
       nextBillingDateUnix: nextUnix,
     });
   } catch (err) {
-    console.error(err);
+    captureError('next-renewal error:', err);
     res.status(500).json({ error: 'Failed to get next billing date' });
   }
 });
 
+// POST /billing/cancel-subscription
+app.post('/billing/cancel-subscription', authenticateToken, async (req, res) => {
+  try {
+    const { teamId } = req.body;
+    if (!teamId) return res.status(400).json({ error: 'teamId is required' });
+
+    // Only the team owner may cancel billing for the team
+    const teamMember = await prisma.teamMember.findFirst({
+      where: { teamId, userId: req.user.id, role: 'owner' },
+      include: { team: { include: { subscription: true } } },
+    });
+    if (!teamMember) return res.status(403).json({ error: 'Only team owners can cancel the subscription' });
+
+    const team = teamMember?.team;
+    const sub  = team?.subscription;
+
+    if (!sub?.stripeSubscriptionId) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+    if (sub.status === 'canceled' || sub.status === 'canceling') {
+      return res.status(400).json({ error: 'Subscription is already cancelled' });
+    }
+
+    const stripeSub = await stripe.subscriptions.update(sub.stripeSubscriptionId, {
+      cancel_at_period_end: true,
+    });
+
+    await prisma.subscription.update({
+      where: { teamId: team.id },
+      data: { status: 'canceling' },
+    });
+
+    const cancelAt = new Date(stripeSub.current_period_end * 1000);
+    res.json({
+      cancelAt: cancelAt.toISOString(),
+      cancelAtFormatted: cancelAt.toLocaleDateString('en-US', {
+        year: 'numeric', month: 'long', day: 'numeric',
+      }),
+    });
+  } catch (err) {
+    captureError('Cancel subscription error:', err);
+    res.status(500).json({ error: 'Failed to cancel subscription' });
+  }
+});
+
 // GET /billing/card/subscription/:subscriptionId
-app.get('/billing/card/subscription/:subscriptionId', async (req, res) => {
+app.get('/billing/card/subscription/:subscriptionId', authenticateToken, async (req, res) => {
   try {
     const { subscriptionId } = req.params;
 
-    // 1) Get the subscription (expand payment method + customer for convenience)
-    const subscription = await stripe.subscriptions.retrieve(subscriptionId, {
-      expand: ['default_payment_method', 'customer'],
+    // Verify this subscriptionId actually belongs to one of the requester's
+    // teams before querying Stripe — otherwise any authenticated user could
+    // pass an arbitrary subscriptionId and read someone else's card details.
+    const owningTeamMember = await prisma.teamMember.findFirst({
+      where: { userId: req.user.id, team: { subscription: { stripeSubscriptionId: subscriptionId } } },
     });
+    if (!owningTeamMember) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
 
-    let paymentMethod;
+    let paymentMethod = null;
 
-    // 2) If the subscription has a default payment method, use that
-    if (subscription.default_payment_method) {
-      paymentMethod = subscription.default_payment_method;
-    } else {
-      // 3) Otherwise fall back to customer's first saved card
-      const customerId = subscription.customer;
+    // Try subscription first — may have its own default payment method
+    try {
+      const subscription = await stripe.subscriptions.retrieve(subscriptionId, {
+        expand: ['default_payment_method'],
+      });
+      if (subscription.default_payment_method) {
+        paymentMethod = subscription.default_payment_method;
+      }
+    } catch {
+      // Subscription not found (cancelled/deleted) — fall through to customer lookup
+    }
 
-      const list = await stripe.paymentMethods.list({
-        customer: customerId,
-        type: 'card',
+    // Fall back to the customer's saved card via DB → Stripe
+    if (!paymentMethod) {
+      const teamMember = await prisma.teamMember.findFirst({
+        where: { userId: req.user.id },
+        include: { team: true },
       });
 
-      if (!list.data.length) {
-        return res.status(404).json({
-          error: 'No card found for this subscription or customer',
-        });
+      const customerId = teamMember?.team?.stripeCustomerId;
+      if (!customerId) {
+        return res.status(404).json({ error: 'No card found' });
       }
 
+      const list = await stripe.paymentMethods.list({ customer: customerId, type: 'card' });
+      if (!list.data.length) {
+        return res.status(404).json({ error: 'No card found' });
+      }
       paymentMethod = list.data[0];
     }
 
@@ -3094,16 +4447,16 @@ app.get('/billing/card/subscription/:subscriptionId', async (req, res) => {
     return res.json({
       subscriptionId,
       paymentMethodId: paymentMethod.id,
-      brand: card.brand, // "visa", "mastercard"
-      last4: card.last4, // "4242"
-      exp_month: card.exp_month, // 4
-      exp_year: card.exp_year, // 2026
-      funding: card.funding, // "credit" | "debit" | "prepaid"
+      brand: card.brand,
+      last4: card.last4,
+      exp_month: card.exp_month,
+      exp_year: card.exp_year,
+      funding: card.funding,
       country: card.country || null,
     });
   } catch (err) {
-    console.error('Stripe subscription card lookup error:', err);
-    res.status(500).json({ error: 'Failed to fetch subscription card' });
+    captureError('Stripe card lookup error:', err);
+    res.status(500).json({ error: 'Failed to fetch card details' });
   }
 });
 
@@ -3122,7 +4475,7 @@ app.patch(
 
       res.json({ success: true, notification });
     } catch (err) {
-      console.error(err);
+      captureError(err);
       res.status(500).json({ error: 'Failed to mark as read' });
     }
   },
@@ -3143,7 +4496,7 @@ app.post(
 
       res.json({ success: true });
     } catch (err) {
-      console.error(err);
+      captureError(err);
       res.status(500).json({ error: 'Failed to mark all as read' });
     }
   },
@@ -3151,7 +4504,7 @@ app.post(
 
 // ─── Password Reset ──────────────────────────────────────────────────────────
 
-app.post('/api/auth/forgot-password', async (req, res) => {
+app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
   const { email } = req.body;
   // Always respond success to prevent email enumeration
   res.json({ message: 'If that email is registered you will receive a reset link.' });
@@ -3184,11 +4537,11 @@ app.post('/api/auth/forgot-password', async (req, res) => {
              <p>If you didn't request this, you can ignore this email.</p>`,
     });
   } catch (err) {
-    console.error('forgot-password error:', err);
+    captureError('forgot-password error:', err);
   }
 });
 
-app.post('/api/auth/reset-password', async (req, res) => {
+app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   const { token, password } = req.body;
   if (!token || !password) {
     return res.status(400).json({ error: 'token and password are required' });
@@ -3213,7 +4566,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
     res.json({ message: 'Password updated successfully' });
   } catch (err) {
-    console.error('reset-password error:', err);
+    captureError('reset-password error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -3262,6 +4615,8 @@ app.get('/api/auth/google/callback', async (req, res) => {
       user = await prisma.user.create({
         data: { email, name, password: '', status: 'active' },
       });
+    } else if (user.status !== 'active') {
+      await prisma.user.update({ where: { id: user.id }, data: { status: 'active' } });
     }
 
     await prisma.account.upsert({
@@ -3281,9 +4636,9 @@ app.get('/api/auth/google/callback', async (req, res) => {
       { expiresIn: '7d' },
     );
 
-    res.redirect(`${frontendUrl}/callback?token=${jwtToken}`);
+    res.redirect(`${frontendUrl}/callback#token=${jwtToken}`); // H3 — use fragment to keep token out of Referer headers and server logs
   } catch (err) {
-    console.error('Google OAuth error:', err?.response?.data || err.message);
+    captureError('Google OAuth error:', err?.response?.data || err.message);
     res.redirect(`${process.env.APP_URL || 'http://localhost:3000'}/callback?error=oauth_failed`);
   }
 });
@@ -3338,6 +4693,8 @@ app.get('/api/auth/github/callback', async (req, res) => {
       user = await prisma.user.create({
         data: { email, name, password: '', status: 'active' },
       });
+    } else if (user.status !== 'active') {
+      await prisma.user.update({ where: { id: user.id }, data: { status: 'active' } });
     }
 
     await prisma.account.upsert({
@@ -3357,9 +4714,9 @@ app.get('/api/auth/github/callback', async (req, res) => {
       { expiresIn: '7d' },
     );
 
-    res.redirect(`${frontendUrl}/callback?token=${jwtToken}`);
+    res.redirect(`${frontendUrl}/callback#token=${jwtToken}`); // H3 — use fragment to keep token out of Referer headers and server logs
   } catch (err) {
-    console.error('GitHub OAuth error:', err?.response?.data || err.message);
+    captureError('GitHub OAuth error:', err?.response?.data || err.message);
     res.redirect(`${process.env.APP_URL || 'http://localhost:3000'}/callback?error=oauth_failed`);
   }
 });
@@ -3393,7 +4750,7 @@ app.patch('/api/users/me', authenticateToken, async (req, res) => {
 
     res.json({ user });
   } catch (err) {
-    console.error('PATCH /api/users/me error:', err);
+    captureError('PATCH /api/users/me error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -3422,15 +4779,15 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
 
     res.json({ message: 'Password updated successfully' });
   } catch (err) {
-    console.error('change-password error:', err);
+    captureError('change-password error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // PATCH /api/users/me/notifications — update notification preferences
 app.patch('/api/users/me/notifications', authenticateToken, async (req, res) => {
-  const { taskAssigned, overdue, dueToday, teamInvite } = req.body;
-  const prefs = { taskAssigned, overdue, dueToday, teamInvite };
+  const { taskAssigned, taskOverdue, dueToday, teamInvite } = req.body;
+  const prefs = { taskAssigned, taskOverdue, dueToday, teamInvite };
 
   try {
     const user = await prisma.user.update({
@@ -3441,7 +4798,7 @@ app.patch('/api/users/me/notifications', authenticateToken, async (req, res) => 
 
     res.json({ notificationPrefs: user.notificationPrefs });
   } catch (err) {
-    console.error('PATCH /api/users/me/notifications error:', err);
+    captureError('PATCH /api/users/me/notifications error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -3457,11 +4814,15 @@ app.delete('/api/users/me', authenticateToken, async (req, res) => {
     await prisma.user.delete({ where: { id: req.user.id } });
     res.json({ message: 'Account deleted' });
   } catch (err) {
-    console.error('DELETE /api/users/me error:', err);
+    captureError('DELETE /api/users/me error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+// Sentry error handler — captures unhandled Express errors before your own handler
+Sentry.setupExpressErrorHandler(app);
+
+// Global Express error handler — handles multer errors + final fallback
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     return res.status(400).json({ error: err.message });
@@ -3471,7 +4832,11 @@ app.use((err, req, res, next) => {
     return res.status(400).json({ error: err.message });
   }
 
-  next(err);
+  // Anything that reaches here is an unhandled server error
+  captureError('Unhandled server error', err);
+  if (!res.headersSent) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Socket.io — authenticate via JWT handshake, join site rooms
@@ -3502,5 +4867,4 @@ io.on('connection', (socket) => {
 
 httpServer.listen(PORT, () => {
   console.log(`QA backend running in ${ENV} mode on port ${PORT}`);
-  console.log('DATABASE_URL:', process.env.DATABASE_URL);
 });

@@ -3,8 +3,9 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 enum Plan {
@@ -19,6 +20,7 @@ enum NotificationType {
   MENTION
   TASK_OVERDUE
   TASK_DUE_TODAY
+  TASK_ASSIGNED
 }
 
 model Site {
@@ -37,6 +39,46 @@ model Site {
   notifications  Notification[]
   kanbanColumns  KanbanColumn[]
   columnOrder    String[]        @default([])
+  boardAccesses  BoardAccess[]
+  boardInvites   BoardInvite[]
+
+  @@index([slug])
+  @@index([teamId])
+}
+
+model BoardAccess {
+  id          String   @id @default(cuid())
+  siteId      String
+  userId      String
+  role        String   @default("viewer") // viewer | commenter | editor
+  invitedById String
+  createdAt   DateTime @default(now())
+
+  site      Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  user      User @relation("boardAccesses", fields: [userId], references: [id], onDelete: Cascade)
+  invitedBy User @relation("boardAccessInviter", fields: [invitedById], references: [id])
+
+  @@unique([siteId, userId])
+  @@index([userId])
+  @@index([siteId])
+}
+
+model BoardInvite {
+  id          String   @id @default(cuid())
+  siteId      String
+  email       String
+  token       String   @unique @default(cuid())
+  role        String   @default("viewer")
+  invitedById String
+  used        Boolean  @default(false)
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  site      Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  invitedBy User @relation("boardInviter", fields: [invitedById], references: [id])
+
+  @@index([token])
+  @@index([siteId])
 }
 
 model KanbanColumn {
@@ -68,10 +110,13 @@ model QAReport {
   userName   String
   dueDate    DateTime?
 
-  pageTitle  String?
-  browser    String?
-  os         String?
-  screenSize String?
+  pageTitle   String?
+  browser     String?
+  os          String?
+  screenSize  String?
+  viewport    String?
+  cssPath     String?
+  consoleLogs Json? // redacted console errors/warnings captured at report time
 
   archived   Boolean   @default(false)
   archivedAt DateTime?
@@ -84,6 +129,15 @@ model QAReport {
   siteId        String?
   activities    Activity[]
   notifications Notification[]
+
+  @@index([userId])
+  @@index([userId, status])
+  @@index([userId, archived])
+  @@index([userId, archived, status])
+  @@index([siteId])
+  @@index([slug])
+  @@index([site])
+  @@index([site, status])
 }
 
 model User {
@@ -107,7 +161,11 @@ model User {
   status              String         @default("pending") // PENDING OR ACTIVE
   lastActive          DateTime       @default(now())
   notificationPrefs   Json?
+  lastSeenNotificationsAt DateTime?
   notifications       Notification[]
+  boardAccesses       BoardAccess[]  @relation("boardAccesses")
+  boardAccessInvites  BoardAccess[]  @relation("boardAccessInviter")
+  boardInvites        BoardInvite[]  @relation("boardInviter")
 }
 
 model Activity {
@@ -125,6 +183,9 @@ model Activity {
   user   User      @relation("activities", fields: [userId], references: [id])
   actor  User      @relation("performedActivities", fields: [actorId], references: [id])
   report QAReport? @relation(fields: [reportId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([reportId])
 }
 
 model Comment {
@@ -230,15 +291,18 @@ model TeamMember {
   updatedAt DateTime @updatedAt
 
   @@unique([userId, teamId])
+  @@index([userId])
+  @@index([teamId])
 }
 
 model TeamInvite {
-  id     String  @id @default(cuid())
-  email  String?
-  code   String  @unique
-  teamId String
-  used   Boolean @default(false)
-  role   String  @default("MEMBER")
+  id      String  @id @default(cuid())
+  email   String?
+  code    String  @unique
+  teamId  String
+  used    Boolean @default(false)
+  oneTime Boolean @default(false)
+  role    String  @default("MEMBER")
 
   team      Team     @relation(fields: [teamId], references: [id])
   expiresAt DateTime
