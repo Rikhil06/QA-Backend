@@ -298,6 +298,10 @@ function corsForRequest(req, res, next) {
       // Allow no-origin requests (mobile apps, curl)
       if (!origin) return callback(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+      // The browser sets this Origin itself — a page can't spoof it — so trusting any
+      // chrome-extension:// origin here only ever lets the real extension through (its
+      // login/register pages run as chrome-extension:// pages, not the target site's origin).
+      if (origin.startsWith('chrome-extension://')) return callback(null, true);
       return callback(new Error(`CORS: origin ${origin} not allowed`));
     },
     credentials: true,
@@ -4842,6 +4846,10 @@ app.use((err, req, res, next) => {
 
   if (err.message?.includes('Invalid file type')) {
     return res.status(400).json({ error: err.message });
+  }
+
+  if (err.message?.startsWith('CORS:')) {
+    return res.status(403).json({ error: 'Origin not allowed' });
   }
 
   // Anything that reaches here is an unhandled server error
