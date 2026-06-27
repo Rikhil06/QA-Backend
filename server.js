@@ -1722,7 +1722,7 @@ app.post(
       const sub = videoFile
         ? await prisma.subscription.findUnique({ where: { teamId: userTeamId }, select: { plan: true } })
         : null;
-      const isAgency = sub?.plan === 'agency';
+      const isAgency = sub?.plan === 'agency' || sub?.plan === 'team';
       const videoKey = (videoFile && isAgency)
         ? `recordings/${Date.now()}_recording.webm`
         : null;
