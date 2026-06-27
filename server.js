@@ -1671,14 +1671,18 @@ app.post(
   '/api/report',
   authenticateToken,
   uploadLimiter,
-  uploadAttachments.single('screenshot'), // must run before requireActivePlan so req.body is populated
+  uploadAttachments.fields([
+    { name: 'screenshot', maxCount: 1 },
+    { name: 'video', maxCount: 1 },       // optional — agency plan only
+  ]),
   requireActivePlan,
   async (req, res) => {
     const { url, comment, x, y, title, priority, type, dueDate, teamId, pageTitle, browser, os, screenSize, viewport, cssPath, consoleLogs } =
       req.body;
-    const file = req.file;
+    const screenshotFile = req.files?.screenshot?.[0];
+    const videoFile      = req.files?.video?.[0];
 
-    if (!file) return res.status(400).json({ error: 'No screenshot uploaded' });
+    if (!screenshotFile) return res.status(400).json({ error: 'No screenshot uploaded' });
 
     // consoleLogs arrives as a JSON string from the extension, already redacted client-side.
     // Re-validate shape/size server-side too — never trust the client as the only guard.
@@ -1710,15 +1714,29 @@ app.post(
       if (!userTeamId)
         return res.status(400).json({ error: 'No team available' });
 
-      // Run user/team validation and R2 upload in parallel
-      const sanitisedScreenshotName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_'); // M5
-      const key = `screenshots/${Date.now()}_${sanitisedScreenshotName}`;
-      const [user, team, , signedUrl] = await Promise.all([
+      // Run user/team validation and R2 uploads in parallel
+      const screenshotKey = `screenshots/${Date.now()}_${screenshotFile.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+
+      // Video is only stored for agency-plan teams — check subscription inline to avoid
+      // uploading a potentially large file that will just get discarded.
+      const sub = videoFile
+        ? await prisma.subscription.findUnique({ where: { teamId: userTeamId }, select: { plan: true } })
+        : null;
+      const isAgency = sub?.plan === 'agency';
+      const videoKey = (videoFile && isAgency)
+        ? `recordings/${Date.now()}_recording.webm`
+        : null;
+
+      const uploads = [
         prisma.user.findUnique({ where: { id: req.user.id } }),
         prisma.team.findUnique({ where: { id: userTeamId } }),
-        uploadBufferToR2(file.buffer, key, file.mimetype),
-        getSignedR2Url(key),
-      ]);
+        uploadBufferToR2(screenshotFile.buffer, screenshotKey, screenshotFile.mimetype),
+        getSignedR2Url(screenshotKey),
+        videoKey ? uploadBufferToR2(videoFile.buffer, videoKey, 'video/webm') : Promise.resolve(null),
+        videoKey ? getSignedR2Url(videoKey) : Promise.resolve(null),
+      ];
+
+      const [user, team, , signedUrl, , videoSignedUrl] = await Promise.all(uploads);
 
       if (!user) return res.status(400).json({ error: 'User not found' });
       if (!team) return res.status(400).json({ error: 'Team not found' });
@@ -1744,6 +1762,7 @@ app.post(
           viewport,
           cssPath: cssPath || null,
           consoleLogs: parsedConsoleLogs,
+          videoPath: videoSignedUrl || null,
           priority,
           type,
           dueDate: dueDate ? new Date(dueDate) : null,
@@ -1965,6 +1984,7 @@ app.get('/api/report/:id', authenticateToken, async (req, res) => {
         viewport: true,
         cssPath: true,
         consoleLogs: true,
+        videoPath: true,
       },
     });
 

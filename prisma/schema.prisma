@@ -116,7 +116,8 @@ model QAReport {
   screenSize  String?
   viewport    String?
   cssPath     String?
-  consoleLogs Json? // redacted console errors/warnings captured at report time
+  consoleLogs Json?   // redacted console errors/warnings captured at report time
+  videoPath   String? // signed R2 URL for the rolling screen-recording (agency plan only)
 
   archived   Boolean   @default(false)
   archivedAt DateTime?
