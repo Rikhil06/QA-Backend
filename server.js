@@ -439,11 +439,11 @@ async function resolveSiteForUser(slugOrDomain, teamId, userId) {
 }
 
 const fileFilter = (req, file, cb) => {
-  const allowed = ['image/png', 'image/jpeg', 'image/webp', 'application/pdf'];
+  const allowed = ['image/png', 'image/jpeg', 'image/webp', 'application/pdf', 'video/webm'];
 
   if (!allowed.includes(file.mimetype)) {
     return cb(
-      new Error('Invalid file type. Only images and PDFs are allowed.'),
+      new Error('Invalid file type. Only images, PDFs, and WebM videos are allowed.'),
       false,
     );
   }
