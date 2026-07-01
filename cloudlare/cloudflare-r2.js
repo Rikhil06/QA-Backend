@@ -88,8 +88,19 @@ const deleteObjectsFromR2 = async (keys) => {
   );
 };
 
+// Accept either a bare R2 key (new format) or a legacy pre-signed URL and
+// return a fresh signed URL valid for 7 days. Returns null if input is falsy.
+const refreshR2Url = async (keyOrUrl) => {
+  if (!keyOrUrl) return null;
+  // If it already looks like an https URL, extract the key first
+  const key = keyOrUrl.startsWith('https://') ? keyFromSignedUrl(keyOrUrl) : keyOrUrl;
+  if (!key) return keyOrUrl; // can't parse legacy URL — return as-is
+  return getSignedR2Url(key);
+};
+
 module.exports = {
   getSignedR2Url,
+  refreshR2Url,
   generateThumbnail,
   uploadBufferToR2,
   deleteObjectFromR2,

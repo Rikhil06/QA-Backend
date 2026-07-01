@@ -121,6 +121,7 @@ process.on('unhandledRejection', (reason) => {
 const {
   uploadBufferToR2,
   getSignedR2Url,
+  refreshR2Url,
   generateThumbnail,
   deleteObjectsFromR2,
   keyFromSignedUrl,
@@ -2116,12 +2117,10 @@ app.post(
         prisma.user.findUnique({ where: { id: req.user.id } }),
         prisma.team.findUnique({ where: { id: userTeamId } }),
         uploadBufferToR2(screenshotFile.buffer, screenshotKey, screenshotFile.mimetype),
-        getSignedR2Url(screenshotKey),
         videoKey ? uploadBufferToR2(videoFile.buffer, videoKey, 'video/webm') : Promise.resolve(null),
-        videoKey ? getSignedR2Url(videoKey) : Promise.resolve(null),
       ];
 
-      const [user, team, , signedUrl, , videoSignedUrl] = await Promise.all(uploads);
+      const [user, team] = await Promise.all(uploads);
 
       if (!user) return res.status(400).json({ error: 'User not found' });
       if (!team) return res.status(400).json({ error: 'Team not found' });
@@ -2147,14 +2146,14 @@ app.post(
           viewport,
           cssPath: cssPath || null,
           consoleLogs: parsedConsoleLogs,
-          videoPath: videoSignedUrl || null,
+          videoPath: videoKey || null,
           priority,
           type,
           dueDate: dueDate ? new Date(dueDate) : null,
           comment,
           x: parseInt(x),
           y: parseInt(y),
-          imagePath: signedUrl,
+          imagePath: screenshotKey,
           userName: req.user.name,
           user: { connect: { id: req.user.id } },
           Site: {
@@ -2172,6 +2171,10 @@ app.post(
           },
         },
       });
+
+      // Generate a fresh signed URL for the immediate response only —
+      // the key is what's persisted in the DB and re-signed on every fetch.
+      const signedUrl = await getSignedR2Url(screenshotKey);
 
       // Create metadata JSON
       const metadata = {
@@ -2277,7 +2280,7 @@ app.get('/api/report', authenticateToken, async (req, res) => {
 
         acc[siteId].reports.push({
           id: report.id,
-          imagePath: report.imagePath,
+          imagePath: report.imagePath, // re-signed below
           title: report.title,
           priority: report.priority,
           type: report.type,
@@ -2296,6 +2299,15 @@ app.get('/api/report', authenticateToken, async (req, res) => {
 
         return acc;
       }, {}),
+    );
+
+    // Re-sign screenshot URLs for all grouped reports
+    await Promise.all(
+      grouped.flatMap((g) =>
+        g.reports.map(async (r) => {
+          r.imagePath = await refreshR2Url(r.imagePath);
+        })
+      )
     );
 
     // 👤 update activity
@@ -2384,6 +2396,8 @@ app.get('/api/report/:id', authenticateToken, async (req, res) => {
 
     res.json({
       ...report,
+      imagePath: await refreshR2Url(report.imagePath),
+      videoPath: await refreshR2Url(report.videoPath),
       dueDate: report.dueDate ? report.dueDate.toISOString() : null,
       timestamp: report.timestamp.toISOString(),
     });
@@ -2827,7 +2841,17 @@ app.get('/api/site/:slug', authenticateToken, async (req, res) => {
       orderBy: { timestamp: 'desc' },
     });
 
-    res.json(reports);
+    // Re-sign screenshot and video URLs so they never expire regardless of
+    // when the report was originally created.
+    const refreshed = await Promise.all(
+      reports.map(async (r) => ({
+        ...r,
+        imagePath: await refreshR2Url(r.imagePath),
+        videoPath: await refreshR2Url(r.videoPath),
+      }))
+    );
+
+    res.json(refreshed);
   } catch (error) {
     captureError('Failed to get site reports:', error);
     res.status(500).json({ error: 'Failed to get site' });
