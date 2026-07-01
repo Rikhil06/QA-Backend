@@ -65,8 +65,6 @@ const http = require('http');
 const { Server: SocketIOServer } = require('socket.io');
 const { PrismaClient } = require('@prisma/client');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
@@ -123,6 +121,7 @@ const {
   getSignedR2Url,
   refreshR2Url,
   generateThumbnail,
+  deleteObjectFromR2,
   deleteObjectsFromR2,
   keyFromSignedUrl,
 } = require('./cloudlare/cloudflare-r2');
@@ -2172,31 +2171,6 @@ app.post(
         },
       });
 
-      // Generate a fresh signed URL for the immediate response only —
-      // the key is what's persisted in the DB and re-signed on every fetch.
-      const signedUrl = await getSignedR2Url(screenshotKey);
-
-      // Create metadata JSON
-      const metadata = {
-        id: report.id,
-        image: signedUrl,
-        title,
-        priority,
-        pagePath,
-        type,
-        comment,
-        url,
-        site: domain,
-        dueDate: dueDate ? new Date(dueDate) : null,
-        slug,
-        siteName,
-        x: parseInt(x),
-        y: parseInt(y),
-        timestamp: report.timestamp.toISOString(),
-        userId: req.user.id,
-        userName: req.user.name,
-      };
-
       // Respond immediately — fire remaining tasks without blocking
       res.json(report);
 
@@ -2204,8 +2178,7 @@ app.post(
       invalidateUserStats(req.user.id);
       invalidateUserSites(req.user.id);
 
-      // Non-blocking: write metadata file and update lastActive after response
-      fs.writeFile(path.join('uploads', `${report.id}.json`), JSON.stringify(metadata, null, 2), () => {});
+      // Non-blocking: update lastActive after response
       prisma.user.update({
         where: { id: req.user.id },
         data: { lastActive: new Date() },
@@ -3486,54 +3459,6 @@ app.patch('/api/site/:slug/columns/reorder', authenticateToken, async (req, res)
   }
 });
 
-app.get('/uploads', authenticateToken, async (req, res) => {
-  const userId = req.user.id;
-  try {
-    const reports = await prisma.qAReport.findMany({
-      where: { userId: userId },
-      orderBy: { timestamp: 'desc' },
-      take: 500,
-    });
-    res.json(reports);
-  } catch (error) {
-    captureError('Error fetching reports:', error);
-    res.status(500).json({ error: 'Failed to fetch reports' });
-  }
-});
-
-app.delete('/api/uploads', authenticateToken, async (req, res) => {
-  try {
-    // Fetch only this user's reports that have local screenshot files
-    const reports = await prisma.qAReport.findMany({
-      where: { userId: req.user.id },
-      select: { id: true, screenshotUrl: true },
-    });
-
-    // Delete only files that belong to this user
-    const UPLOAD_DIR = path.join(__dirname, 'uploads');
-    await Promise.all(
-      reports
-        .filter((r) => r.screenshotUrl)
-        .map(async (r) => {
-          const filename = path.basename(r.screenshotUrl);
-          const filePath = path.join(UPLOAD_DIR, filename);
-          try { await fs.promises.unlink(filePath); } catch { /* already gone */ }
-        }),
-    );
-
-    await prisma.qAReport.deleteMany({ where: { userId: req.user.id } });
-
-    await prisma.user.update({
-      where: { id: req.user.id },
-      data: { lastActive: new Date() },
-    });
-
-    res.json({ message: 'Your uploads and reports have been deleted.' });
-  } catch (error) {
-    captureError('Error deleting uploads:', error);
-    res.status(500).json({ error: 'Failed to delete uploads' });
-  }
-});
 
 app.patch('/api/report/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
@@ -4306,29 +4231,26 @@ app.delete('/api/report/:id', authenticateToken, async (req, res) => {
     let deletedSiteSlug = null;
 
     await prisma.$transaction(async (tx) => {
-      // Get report incl. site id + image path
+      // Get report incl. site id + R2 keys for cleanup
       const report = await tx.qAReport.findUnique({
         where: { id },
-        select: { id: true, siteId: true, imagePath: true, Site: { select: { slug: true } } },
+        select: { id: true, siteId: true, imagePath: true, videoPath: true, Site: { select: { slug: true } } },
       });
 
       if (!report) {
         throw new Error('REPORT_NOT_FOUND');
       }
 
-      const { siteId, imagePath } = report;
+      const { siteId, imagePath, videoPath } = report;
       deletedSiteSlug = report.Site?.slug ?? null;
 
-      // ---- FILE CLEANUP ----
-      if (imagePath) {
-        const abs = path.join(__dirname, imagePath);
-        // C2 — path traversal guard: only delete files within the uploads directory
-        const uploadsDir = path.join(__dirname, 'uploads');
-        if (abs.startsWith(uploadsDir) && fs.existsSync(abs)) fs.unlinkSync(abs);
+      // ---- R2 CLEANUP ----
+      const r2Keys = [imagePath, videoPath].filter(Boolean);
+      if (r2Keys.length) {
+        await deleteObjectsFromR2(r2Keys).catch((err) =>
+          captureError('R2 cleanup on report delete failed:', err)
+        );
       }
-
-      const metadataPath = path.join(__dirname, 'uploads', `${id}.json`);
-      if (fs.existsSync(metadataPath)) fs.unlinkSync(metadataPath);
 
       // ---- DELETE REPORT ----
       await tx.qAReport.delete({ where: { id } });
