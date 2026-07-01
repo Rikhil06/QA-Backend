@@ -1587,27 +1587,32 @@ app.post('/teams/:teamId/invite-link', authenticateToken, async (req, res) => {
   const { teamId } = req.params;
   const { role: requestedRole = 'member', oneTime = false } = req.body;
 
-  // H1 — membership check
-  const membership = await prisma.teamMember.findFirst({ where: { teamId, userId: req.user.id } });
-  if (!membership) return res.status(403).json({ error: 'Access denied' });
+  try {
+    // H1 — membership check
+    const membership = await prisma.teamMember.findFirst({ where: { teamId, userId: req.user.id } });
+    if (!membership) return res.status(403).json({ error: 'Access denied' });
 
-  // Only owners may mint owner-role invite links — otherwise any member could
-  // generate a link that grants whoever opens it owner access.
-  const safeRequestedRole = ['member', 'owner'].includes(requestedRole) ? requestedRole : 'member';
-  const role = safeRequestedRole === 'owner' && membership.role !== 'owner' ? 'member' : safeRequestedRole;
+    // Only owners may mint owner-role invite links — otherwise any member could
+    // generate a link that grants whoever opens it owner access.
+    const safeRequestedRole = ['member', 'owner'].includes(requestedRole) ? requestedRole : 'member';
+    const role = safeRequestedRole === 'owner' && membership.role !== 'owner' ? 'member' : safeRequestedRole;
 
-  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-  const code = handleGenerateNewCode();
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const code = handleGenerateNewCode();
 
-  const invite = await prisma.teamInvite.create({
-    data: { teamId, code, expiresAt, role, email: null, oneTime: !!oneTime },
-  });
+    const invite = await prisma.teamInvite.create({
+      data: { teamId, code, expiresAt, role, email: null, oneTime: !!oneTime },
+    });
 
-  res.json({
-    code,
-    oneTime: invite.oneTime,
-    inviteUrl: `${process.env.APP_URL}/invite/${code}`,
-  });
+    res.json({
+      code,
+      oneTime: invite.oneTime,
+      inviteUrl: `${process.env.APP_URL}/invite/${code}`,
+    });
+  } catch (error) {
+    captureError('Failed to create invite link:', error);
+    res.status(500).json({ error: 'Failed to create invite link' });
+  }
 });
 
 app.get('/teams/:teamId/invite-link', authenticateToken, async (req, res) => {
@@ -1755,62 +1760,67 @@ app.post('/teams/join', authenticateToken, async (req, res) => {
   const userId = req.user.id;
   const { code } = req.body;
 
-  const invite = await prisma.teamInvite.findUnique({
-    where: { code },
-    include: { team: true },
-  });
-
-  if (!invite) return res.status(400).json({ error: 'Invalid invite link' });
-
-  // check expiry
-  if (invite.expiresAt && invite.expiresAt < new Date())
-    return res.status(400).json({ error: 'This invite has expired' });
-
-  // email-specific invites are always single-use; link invites are reusable
-  // unless explicitly marked one-time
-  if ((invite.email !== null || invite.oneTime) && invite.used) {
-    return res.status(400).json({ error: 'This invite has already been used' });
-  }
-
-  // prevent double-joining
-  const existingMember = await prisma.teamMember.findFirst({
-    where: { teamId: invite.teamId, userId },
-  });
-
-  if (existingMember) {
-    return res.status(200).json({ joined: true, alreadyMember: true, teamName: invite.team.name });
-  }
-
-  // Enforce member limit before joining
-  const [memberCount, teamForPlan] = await Promise.all([
-    prisma.teamMember.count({ where: { teamId: invite.teamId } }),
-    prisma.team.findUnique({
-      where: { id: invite.teamId },
-      include: { subscription: true },
-    }),
-  ]);
-  const joinPlan = teamForPlan?.subscription?.plan || 'free';
-  const joinLimits = PLAN_LIMITS[joinPlan] || PLAN_LIMITS.free;
-  if (memberCount >= joinLimits.members) {
-    return res.status(403).json({
-      error: `This team has reached its ${joinLimits.members}-member limit on the ${joinPlan} plan. Ask the team owner to upgrade.`,
+  try {
+    const invite = await prisma.teamInvite.findUnique({
+      where: { code },
+      include: { team: true },
     });
+
+    if (!invite) return res.status(400).json({ error: 'Invalid invite link' });
+
+    // check expiry
+    if (invite.expiresAt && invite.expiresAt < new Date())
+      return res.status(400).json({ error: 'This invite has expired' });
+
+    // email-specific invites are always single-use; link invites are reusable
+    // unless explicitly marked one-time
+    if ((invite.email !== null || invite.oneTime) && invite.used) {
+      return res.status(400).json({ error: 'This invite has already been used' });
+    }
+
+    // prevent double-joining
+    const existingMember = await prisma.teamMember.findFirst({
+      where: { teamId: invite.teamId, userId },
+    });
+
+    if (existingMember) {
+      return res.status(200).json({ joined: true, alreadyMember: true, teamName: invite.team.name });
+    }
+
+    // Enforce member limit before joining
+    const [memberCount, teamForPlan] = await Promise.all([
+      prisma.teamMember.count({ where: { teamId: invite.teamId } }),
+      prisma.team.findUnique({
+        where: { id: invite.teamId },
+        include: { subscription: true },
+      }),
+    ]);
+    const joinPlan = teamForPlan?.subscription?.plan || 'free';
+    const joinLimits = PLAN_LIMITS[joinPlan] || PLAN_LIMITS.free;
+    if (memberCount >= joinLimits.members) {
+      return res.status(403).json({
+        error: `This team has reached its ${joinLimits.members}-member limit on the ${joinPlan} plan. Ask the team owner to upgrade.`,
+      });
+    }
+
+    const ops = [
+      prisma.teamMember.create({
+        data: { teamId: invite.teamId, userId, role: invite.role },
+      }),
+    ];
+
+    // Only mark as used for single-use invites (email-specific or one-time links)
+    if (invite.email !== null || invite.oneTime) {
+      ops.push(prisma.teamInvite.update({ where: { id: invite.id }, data: { used: true } }));
+    }
+
+    await prisma.$transaction(ops);
+
+    res.json({ joined: true, teamName: invite.team.name });
+  } catch (error) {
+    captureError('Failed to join team:', error);
+    res.status(500).json({ error: 'Failed to join team' });
   }
-
-  const ops = [
-    prisma.teamMember.create({
-      data: { teamId: invite.teamId, userId, role: invite.role },
-    }),
-  ];
-
-  // Only mark as used for single-use invites (email-specific or one-time links)
-  if (invite.email !== null || invite.oneTime) {
-    ops.push(prisma.teamInvite.update({ where: { id: invite.id }, data: { used: true } }));
-  }
-
-  await prisma.$transaction(ops);
-
-  res.json({ joined: true, teamName: invite.team.name });
 });
 
 app.get('/teams/:teamId/members', authenticateToken, async (req, res) => {
@@ -3914,6 +3924,18 @@ app.patch('/api/report/:id/assignee', authenticateToken, async (req, res) => {
   try {
     const access = await assertReportAccess(id, req.user.id, res);
     if (!access) return;
+
+    // Verify the target assignee is a member of the same team as the report
+    const siteTeamId = access.Site?.teamId;
+    if (siteTeamId) {
+      const targetMember = await prisma.teamMember.findFirst({
+        where: { teamId: siteTeamId, userId },
+      });
+      if (!targetMember) {
+        return res.status(403).json({ error: 'Assignee is not a member of this team' });
+      }
+    }
+
     const updated = await prisma.qAReport.update({
       where: { id },
       data: { userId, userName },
@@ -4683,11 +4705,21 @@ app.get('/billing/next-renewal/:subscriptionId', authenticateToken, async (req, 
     // Read from DB — currentPeriodEnd is synced via webhook on every renewal
     const dbSub = await prisma.subscription.findFirst({
       where: { stripeSubscriptionId: subscriptionId },
-      select: { currentPeriodEnd: true, interval: true, createdAt: true },
+      select: { currentPeriodEnd: true, interval: true, createdAt: true, teamId: true },
     });
 
     if (!dbSub) {
       return res.status(404).json({ error: 'Subscription not found' });
+    }
+
+    // Verify the authenticated user is a member of the team owning this subscription
+    if (dbSub.teamId) {
+      const membership = await prisma.teamMember.findFirst({
+        where: { teamId: dbSub.teamId, userId: req.user.id },
+      });
+      if (!membership) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
     }
 
     let nextDate;
@@ -4744,6 +4776,33 @@ app.get('/billing/next-renewal/:subscriptionId', authenticateToken, async (req, 
   } catch (err) {
     captureError('next-renewal error:', err);
     res.status(500).json({ error: 'Failed to get next billing date' });
+  }
+});
+
+// POST /billing/portal — create a Stripe Customer Portal session
+app.post('/billing/portal', authenticateToken, async (req, res) => {
+  try {
+    const { returnUrl } = req.body;
+
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      include: { teams: { include: { team: { include: { subscription: true } } } } },
+    });
+
+    const sub = user?.teams?.[0]?.team?.subscription;
+    if (!sub?.stripeCustomerId) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: sub.stripeCustomerId,
+      return_url: returnUrl || process.env.APP_URL + '/usage-billing',
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    captureError('Failed to create billing portal session:', error);
+    res.status(500).json({ error: 'Failed to open billing portal' });
   }
 });
 
