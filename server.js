@@ -2,11 +2,43 @@
 require('dotenv').config();
 
 // ── Validate required environment variables ──────────────────────────────────
-const REQUIRED_ENV = ['JWT_SECRET', 'DATABASE_URL'];
+const REQUIRED_ENV = [
+  // Core
+  'JWT_SECRET',
+  'DATABASE_URL',
+  'APP_URL',
+  // Stripe billing
+  'STRIPE_SECRET_KEY',
+  'STRIPE_WEBHOOK_SECRET',
+  'PRICE_STARTER_MONTHLY',
+  'PRICE_STARTER_YEARLY',
+  'PRICE_TEAM_MONTHLY',
+  'PRICE_TEAM_YEARLY',
+  // Cloudflare R2 storage
+  'R2_ACCOUNT_ID',
+  'R2_ACCESS_KEY',
+  'R2_SECRET_KEY',
+  'R2_BUCKET_NAME',
+  // Email
+  'RESEND_API_KEY',
+];
+
+const OPTIONAL_ENV = [
+  'ALLOWED_ORIGINS', // defaults to APP_URL
+  'SENTRY_DSN',      // optional — error tracking only
+  'PRICE_FREE_MONTHLY',
+  'PRICE_FREE_YEARLY',
+];
+
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
 if (missing.length) {
-  console.error(`[startup] Missing required environment variables: ${missing.join(', ')}`);
+  console.error(`[startup] FATAL — missing required environment variables:\n  ${missing.join('\n  ')}`);
   process.exit(1);
+}
+
+const missingOptional = OPTIONAL_ENV.filter((k) => !process.env[k]);
+if (missingOptional.length) {
+  console.warn(`[startup] Optional env vars not set (non-fatal): ${missingOptional.join(', ')}`);
 }
 
 // ── Sentry must be initialised before everything else ──────────────────────
@@ -36,6 +68,8 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
+const cookieParser = require('cookie-parser');
+const crypto = require('crypto');
 const axios = require('axios');
 const { Resend } = require('resend');
 const morgan = require('morgan');
@@ -88,6 +122,8 @@ const {
   uploadBufferToR2,
   getSignedR2Url,
   generateThumbnail,
+  deleteObjectsFromR2,
+  keyFromSignedUrl,
 } = require('./cloudlare/cloudflare-r2');
 
 const app = express();
@@ -107,6 +143,12 @@ const io = new SocketIOServer(httpServer, {
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 4000;
 const ENV = process.env.NODE_ENV || 'development';
+
+// In-memory revoked token set. Tokens are added on logout and checked in
+// authenticateToken. Resets on process restart, but combined with the 7d
+// expiry and httpOnly cookie clearing this covers the primary threat model.
+// Replace with Redis for multi-instance deployments.
+const revokedJtis = new Set();
 
 async function getStripeAccountEmail() {
   const account = await stripe.accounts.retrieve();
@@ -176,35 +218,39 @@ app.post(
 
         const sub = await stripe.subscriptions.retrieve(obj.subscription);
         const checkoutPlan = mapPriceToPlan(sub.items.data[0].price.id);
+        const periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
 
-        await prisma.subscription.upsert({
-          where: { teamId },
-          update: {
-            plan: checkoutPlan,
-            interval: sub.items.data[0].price.recurring.interval,
-            status: sub.status,
-            stripeCustomerId: sub.customer,
-            stripeSubscriptionId: sub.id,
-            stripePriceId: sub.items.data[0].price.id,
-            currentPeriodEnd: sub.current_period_end
-              ? new Date(sub.current_period_end * 1000)
-              : null,
-            teamId,
-          },
-          create: {
-            teamId,
-            plan: checkoutPlan,
-            interval: sub.items.data[0].price.recurring.interval,
-            status: sub.status,
-            stripeCustomerId: sub.customer,
-            stripeSubscriptionId: sub.id,
-            stripePriceId: sub.items.data[0].price.id,
-            currentPeriodEnd: sub.current_period_end
-              ? new Date(sub.current_period_end * 1000)
-              : null,
-          },
-        });
-        if (teamId) await prisma.team.update({ where: { id: teamId }, data: { plan: checkoutPlan } });
+        await prisma.$transaction([
+          prisma.subscription.upsert({
+            where: { teamId },
+            update: {
+              plan: checkoutPlan,
+              interval: sub.items.data[0].price.recurring.interval,
+              status: sub.status,
+              stripeCustomerId: sub.customer,
+              stripeSubscriptionId: sub.id,
+              stripePriceId: sub.items.data[0].price.id,
+              currentPeriodEnd: periodEnd,
+              teamId,
+            },
+            create: {
+              teamId,
+              plan: checkoutPlan,
+              interval: sub.items.data[0].price.recurring.interval,
+              status: sub.status,
+              stripeCustomerId: sub.customer,
+              stripeSubscriptionId: sub.id,
+              stripePriceId: sub.items.data[0].price.id,
+              currentPeriodEnd: periodEnd,
+            },
+          }),
+          prisma.team.update({ where: { id: teamId }, data: { plan: checkoutPlan } }),
+        ]);
+
+        // Send plan activation email to all team members
+        sendPlanEmail(teamId, checkoutPlan, 'activated').catch((err) =>
+          captureError('Failed to send plan activation email:', err)
+        );
 
         break;
       }
@@ -213,43 +259,61 @@ app.post(
       case 'customer.subscription.updated': {
         if (!teamId) break;
         const subPlan = mapPriceToPlan(obj.items.data[0].price.id);
-        await prisma.subscription.upsert({
-          where: { teamId },
-          update: {
-            plan: subPlan,
-            interval: obj.items.data[0].price.recurring.interval,
-            status: obj.status,
-            stripePriceId: obj.items.data[0].price.id,
-            currentPeriodEnd: obj.current_period_end
-              ? new Date(obj.current_period_end * 1000)
-              : null,
-            teamId,
-          },
-          create: {
-            teamId,
-            plan: subPlan,
-            interval: obj.items.data[0].price.recurring.interval,
-            status: obj.status,
-            stripeSubscriptionId: obj.id,
-            stripePriceId: obj.items.data[0].price.id,
-            currentPeriodEnd: obj.current_period_end
-              ? new Date(obj.current_period_end * 1000)
-              : null,
-          },
-        });
-        await prisma.team.update({ where: { id: teamId }, data: { plan: subPlan } });
+        const periodEnd = obj.current_period_end ? new Date(obj.current_period_end * 1000) : null;
+
+        // Fetch previous plan before updating so we can detect actual upgrades/downgrades
+        const existingTeam = await prisma.team.findUnique({ where: { id: teamId }, select: { plan: true } });
+        const previousPlan = existingTeam?.plan;
+
+        await prisma.$transaction([
+          prisma.subscription.upsert({
+            where: { teamId },
+            update: {
+              plan: subPlan,
+              interval: obj.items.data[0].price.recurring.interval,
+              status: obj.status,
+              stripePriceId: obj.items.data[0].price.id,
+              currentPeriodEnd: periodEnd,
+              teamId,
+            },
+            create: {
+              teamId,
+              plan: subPlan,
+              interval: obj.items.data[0].price.recurring.interval,
+              status: obj.status,
+              stripeSubscriptionId: obj.id,
+              stripePriceId: obj.items.data[0].price.id,
+              currentPeriodEnd: periodEnd,
+            },
+          }),
+          prisma.team.update({ where: { id: teamId }, data: { plan: subPlan } }),
+        ]);
+
+        // Only email on genuine plan changes (not renewal updates)
+        if (previousPlan && previousPlan !== subPlan) {
+          const direction = getPlanTier(subPlan) > getPlanTier(previousPlan) ? 'upgraded' : 'downgraded';
+          sendPlanEmail(teamId, subPlan, direction).catch((err) =>
+            captureError('Failed to send plan change email:', err)
+          );
+        }
 
         break;
       }
 
       case 'customer.subscription.deleted': {
-        if (teamId) {
-          await prisma.subscription.update({
+        if (!teamId) break;
+        await prisma.$transaction([
+          prisma.subscription.update({
             where: { teamId },
             data: { status: 'canceled', plan: 'free' },
-          });
-          await prisma.team.update({ where: { id: teamId }, data: { plan: 'free' } });
-        }
+          }),
+          prisma.team.update({ where: { id: teamId }, data: { plan: 'free' } }),
+        ]);
+
+        sendPlanEmail(teamId, 'free', 'canceled').catch((err) =>
+          captureError('Failed to send cancellation email:', err)
+        );
+
         break;
       }
     }
@@ -287,7 +351,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || process.env.APP_URL || '
 // bearer-token authenticated (not cookie-based), so reflecting any origin here doesn't expose
 // the dashboard to CSRF — a malicious page can't read the extension's stored token. The
 // dashboard app itself still goes through the strict allowlist below.
-const EXTENSION_ROUTES = ['/api/teams', '/api/report'];
+const EXTENSION_ROUTES = ['/api/report'];
 
 function corsForRequest(req, res, next) {
   if (EXTENSION_ROUTES.includes(req.path)) {
@@ -298,10 +362,15 @@ function corsForRequest(req, res, next) {
       // Allow no-origin requests (mobile apps, curl)
       if (!origin) return callback(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-      // The browser sets this Origin itself — a page can't spoof it — so trusting any
-      // chrome-extension:// origin here only ever lets the real extension through (its
-      // login/register pages run as chrome-extension:// pages, not the target site's origin).
-      if (origin.startsWith('chrome-extension://')) return callback(null, true);
+      // The browser sets the Origin header itself so a web page cannot spoof a
+      // chrome-extension:// origin. In production we pin to the published extension ID
+      // via CHROME_EXTENSION_ID; in dev we allow any extension origin for ease of testing.
+      const allowedExtId = process.env.CHROME_EXTENSION_ID;
+      if (allowedExtId) {
+        if (origin === `chrome-extension://${allowedExtId}`) return callback(null, true);
+      } else if (origin.startsWith('chrome-extension://')) {
+        return callback(null, true);
+      }
       return callback(new Error(`CORS: origin ${origin} not allowed`));
     },
     credentials: true,
@@ -312,6 +381,7 @@ app.use(corsForRequest);
 
 // Ensure preflight works for all routes
 app.options('*', corsForRequest);
+app.use(cookieParser());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Health check — used by Render, uptime monitors, load balancers
@@ -352,6 +422,17 @@ const searchLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many search requests, please slow down' },
+});
+
+// Per-user resend-verification limiter — placed after authenticateToken so req.user is available.
+// 3 emails per hour per user prevents inbox-spam without blocking legitimate use.
+const resendVerificationLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 3,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.id || ipKeyGenerator(req),
+  message: { error: 'Too many verification emails sent. Please wait before requesting another.' },
 });
 
 // General API guard — broad safety net for all /api/* routes
@@ -843,11 +924,87 @@ async function logActivity({
 
 module.exports = logActivity;
 
+// ── Shared email template ───────────────────────────────────────────────────
+function emailTemplate({ badgeText, heading, headingHighlight, body, ctaUrl, ctaLabel, footerNote }) {
+  const highlight = headingHighlight
+    ? heading.replace(
+        headingHighlight,
+        `<span style="background:linear-gradient(135deg,#a78bfa,#60a5fa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">${headingHighlight}</span>`
+      )
+    : heading;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${heading}</title></head>
+<body style="margin:0;padding:0;background:#0a0a0a;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0a0a0a;padding:40px 16px;">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;">
+
+        <!-- Logo header -->
+        <tr><td style="padding-bottom:28px;" align="center">
+          <table cellpadding="0" cellspacing="0">
+            <tr>
+              <td style="background:linear-gradient(135deg,#7c3aed,#3b82f6);border-radius:10px;width:36px;height:36px;text-align:center;vertical-align:middle;" align="center">
+                <svg viewBox="0 0 24 24" width="20" height="20" style="display:block;margin:8px auto;">
+                  <path d="M12 20h9" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </td>
+              <td style="padding-left:10px;font-size:16px;font-weight:600;color:#ffffff;letter-spacing:-0.3px;">Annoture</td>
+            </tr>
+          </table>
+        </td></tr>
+
+        <!-- Card -->
+        <tr><td style="background:#141414;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:36px 32px;">
+
+          <!-- Badge -->
+          ${badgeText ? `<div style="display:inline-block;padding:5px 12px;border-radius:999px;background:rgba(124,58,237,0.12);border:1px solid rgba(124,58,237,0.25);color:#a78bfa;font-size:11px;font-weight:500;letter-spacing:0.3px;margin-bottom:20px;">${badgeText}</div>` : ''}
+
+          <!-- Heading -->
+          <h1 style="margin:0 0 12px;font-size:22px;font-weight:700;color:#ffffff;line-height:1.3;letter-spacing:-0.4px;">${highlight}</h1>
+
+          <!-- Body -->
+          <div style="color:rgba(255,255,255,0.55);font-size:14px;line-height:1.7;margin-bottom:28px;">${body}</div>
+
+          <!-- CTA -->
+          ${ctaUrl ? `
+          <table cellpadding="0" cellspacing="0">
+            <tr><td style="border-radius:10px;background:linear-gradient(135deg,#7c3aed,#6d28d9);">
+              <a href="${ctaUrl}" style="display:inline-block;padding:13px 26px;color:#ffffff;font-size:14px;font-weight:600;text-decoration:none;border-radius:10px;letter-spacing:-0.1px;">${ctaLabel || 'Open Annoture'} &rarr;</a>
+            </td></tr>
+          </table>` : ''}
+
+          <!-- Divider -->
+          <div style="border-top:1px solid rgba(255,255,255,0.06);margin:28px 0;"></div>
+
+          <!-- Footer note -->
+          <p style="margin:0;color:rgba(255,255,255,0.25);font-size:12px;line-height:1.6;">${footerNote || 'Questions? Email us at <a href="mailto:hello@annoture.com" style="color:rgba(167,139,250,0.7);text-decoration:none;">hello@annoture.com</a>'}</p>
+
+        </td></tr>
+
+        <!-- Bottom footer -->
+        <tr><td style="padding-top:24px;text-align:center;">
+          <p style="margin:0;color:rgba(255,255,255,0.18);font-size:11px;">
+            &copy; ${new Date().getFullYear()} Annoture &middot;
+            <a href="https://annoture.com/privacy-policy" style="color:rgba(255,255,255,0.25);text-decoration:none;">Privacy Policy</a> &middot;
+            <a href="https://annoture.com/terms" style="color:rgba(255,255,255,0.25);text-decoration:none;">Terms</a>
+          </p>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+}
+
 // ── Email verification helper ───────────────────────────────────────────────
 async function sendVerificationEmail(email, name) {
   const crypto = require('crypto');
   const token = crypto.randomBytes(32).toString('hex');
-  const expires = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+  const expires = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
   await prisma.verificationToken.upsert({
     where: { token },
@@ -862,23 +1019,93 @@ async function sendVerificationEmail(email, name) {
     from: process.env.EMAIL_FROM || 'Annoture <onboarding@resend.dev>',
     to: email,
     subject: 'Verify your email address',
-    html: `
-      <div style="font-family:ui-sans-serif,system-ui,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#121212;color:#fff;border-radius:12px;">
-        <h1 style="font-size:20px;font-weight:600;margin-bottom:8px;">Verify your email</h1>
-        <p style="color:#aaa;font-size:14px;margin-bottom:24px;">Hi ${displayName}, click below to verify your email address and activate your account.</p>
-        <a href="${verifyUrl}"
-           style="display:inline-block;padding:12px 24px;background:#7c3aed;color:#fff;border-radius:8px;text-decoration:none;font-size:14px;font-weight:500;">
-          Verify email
-        </a>
-        <p style="color:#555;font-size:12px;margin-top:24px;">
-          This link expires in 24 hours. If you didn't create an account you can safely ignore this email.
-        </p>
-        <p style="color:#444;font-size:11px;margin-top:8px;">
-          Or copy this link: <a href="${verifyUrl}" style="color:#7c3aed;">${verifyUrl}</a>
-        </p>
-      </div>
-    `,
+    html: emailTemplate({
+      badgeText: 'Action required',
+      heading: `Verify your email, ${displayName}`,
+      headingHighlight: displayName,
+      body: `Click the button below to verify your email address and activate your Annoture account. This link expires in <strong style="color:rgba(255,255,255,0.7);">24 hours</strong>.`,
+      ctaUrl: verifyUrl,
+      ctaLabel: 'Verify email',
+      footerNote: `If you didn't create an Annoture account you can safely ignore this email. Or copy this link: <a href="${verifyUrl}" style="color:rgba(167,139,250,0.7);text-decoration:none;word-break:break-all;">${verifyUrl}</a>`,
+    }),
   });
+}
+
+const PLAN_TIER = { free: 0, starter: 1, team: 2, agency: 3 };
+function getPlanTier(plan) { return PLAN_TIER[plan] ?? 0; }
+
+const PLAN_LABELS = { free: 'Free', starter: 'Starter', team: 'Team', agency: 'Agency' };
+
+async function sendPlanEmail(teamId, plan, action) {
+  const team = await prisma.team.findUnique({
+    where: { id: teamId },
+    include: { members: { include: { user: { select: { email: true, name: true } } } } },
+  });
+  if (!team) return;
+
+  const appUrl = process.env.APP_URL || 'https://app.annoture.com';
+  const planLabel = PLAN_LABELS[plan] || plan;
+
+  const configs = {
+    activated: (name) => ({
+      badgeText: `${planLabel} plan`,
+      heading: `You're on the ${planLabel} plan`,
+      headingHighlight: planLabel,
+      body: `Hi <strong style="color:rgba(255,255,255,0.8);">${name}</strong>, your ${planLabel} subscription is now active. Head to your dashboard to start capturing bug reports.`,
+      ctaUrl: appUrl,
+      ctaLabel: 'Go to dashboard',
+      subject: `You're on the ${planLabel} plan`,
+    }),
+    upgraded: (name) => ({
+      badgeText: 'Plan upgraded',
+      heading: `Upgraded to ${planLabel}`,
+      headingHighlight: planLabel,
+      body: `Hi <strong style="color:rgba(255,255,255,0.8);">${name}</strong>, your plan has been upgraded to <strong style="color:rgba(255,255,255,0.8);">${planLabel}</strong>. Your new limits and features are available immediately.`,
+      ctaUrl: appUrl,
+      ctaLabel: 'Go to dashboard',
+      subject: `Your plan has been upgraded to ${planLabel}`,
+    }),
+    downgraded: (name) => ({
+      badgeText: 'Plan changed',
+      heading: `Your plan is now ${planLabel}`,
+      headingHighlight: planLabel,
+      body: `Hi <strong style="color:rgba(255,255,255,0.8);">${name}</strong>, your Annoture plan has been updated to <strong style="color:rgba(255,255,255,0.8);">${planLabel}</strong>. Visit billing settings if you have questions about your new limits.`,
+      ctaUrl: `${appUrl}/usage-billing`,
+      ctaLabel: 'View billing',
+      subject: `Your plan has changed to ${planLabel}`,
+    }),
+    canceled: (name) => ({
+      badgeText: 'Subscription ended',
+      heading: 'Your subscription has been cancelled',
+      headingHighlight: null,
+      body: `Hi <strong style="color:rgba(255,255,255,0.8);">${name}</strong>, your Annoture subscription has ended and your account has moved to the Free plan. Your data is safe — you can resubscribe at any time.`,
+      ctaUrl: `${appUrl}/usage-billing`,
+      ctaLabel: 'Resubscribe',
+      subject: 'Your Annoture subscription has been cancelled',
+    }),
+  };
+
+  await Promise.all(
+    team.members.map(({ user }) => {
+      const displayName = user.name || user.email;
+      const config = configs[action] ? configs[action](displayName) : {
+        badgeText: 'Plan update',
+        heading: `Your plan has changed to ${planLabel}`,
+        headingHighlight: planLabel,
+        body: `Hi <strong style="color:rgba(255,255,255,0.8);">${displayName}</strong>, your Annoture plan has been updated to ${planLabel}.`,
+        ctaUrl: appUrl,
+        ctaLabel: 'Go to dashboard',
+        subject: `Your Annoture plan has changed`,
+      };
+
+      return resend.emails.send({
+        from: process.env.EMAIL_FROM || 'Annoture <onboarding@resend.dev>',
+        to: user.email,
+        subject: config.subject,
+        html: emailTemplate(config),
+      });
+    })
+  );
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
@@ -926,9 +1153,9 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     });
 
     const token = jwt.sign(
-      { name: user.name, id: user.id, email: user.email, teams: [] },
+      { jti: crypto.randomUUID(), name: user.name, id: user.id, email: user.email, teams: [] },
       process.env.JWT_SECRET,
-      { expiresIn: '30d' },
+      { expiresIn: '7d' },
     );
 
     // Send verification email non-blocking — don't fail registration if email fails
@@ -961,6 +1188,10 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       });
     }
 
+    setAuthCookie(res, token);
+    // token is also returned in the body for the Chrome extension, which reads it from
+    // the JSON response and stores it in chrome.storage.session (isolated, cleared on
+    // browser close). The web app ignores data.token and relies on the httpOnly cookie.
     res.status(201).json({
       message: 'User registered',
       user: { id: user.id, email: user.email, emailVerified: false },
@@ -970,6 +1201,19 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     captureError('Register error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = req.cookies?.token || authHeader?.split(' ')[1];
+  if (token) {
+    try {
+      const decoded = jwt.decode(token);
+      if (decoded?.jti) revokedJtis.add(decoded.jti);
+    } catch {}
+  }
+  clearAuthCookie(res);
+  res.json({ ok: true });
 });
 
 // Verify email — called when user clicks the link in their email
@@ -1005,7 +1249,7 @@ app.get('/api/auth/verify-email', async (req, res) => {
 });
 
 // Resend verification email
-app.post('/api/auth/resend-verification', authLimiter, authenticateToken, async (req, res) => {
+app.post('/api/auth/resend-verification', authLimiter, authenticateToken, resendVerificationLimiter, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -1043,6 +1287,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
     const token = jwt.sign(
       {
+        jti: crypto.randomUUID(),
         name: user.name,
         id: user.id,
         email: user.email,
@@ -1050,10 +1295,13 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
       },
       process.env.JWT_SECRET,
       {
-        expiresIn: '30d',
+        expiresIn: '7d',
       },
     );
 
+    setAuthCookie(res, token);
+    // token also returned in body for the Chrome extension (stored in chrome.storage.session).
+    // The web app ignores data.token and relies on the httpOnly cookie instead.
     res.json({
       token,
       user: {
@@ -1069,15 +1317,43 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   }
 });
 
+function setAuthCookie(res, token) {
+  const isProd = process.env.NODE_ENV === 'production';
+  const cookieOpts = {
+    httpOnly: true,
+    path: '/',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days in ms
+    ...(isProd ? { secure: true, sameSite: 'none' } : { sameSite: 'lax' }),
+  };
+  res.cookie('token', token, cookieOpts);
+  // Readable indicator so client JS can know a session exists without seeing the JWT
+  res.cookie('has_session', '1', { ...cookieOpts, httpOnly: false });
+}
+
+function clearAuthCookie(res) {
+  const isProd = process.env.NODE_ENV === 'production';
+  const clearOpts = {
+    httpOnly: true,
+    path: '/',
+    ...(isProd ? { secure: true, sameSite: 'none' } : { sameSite: 'lax' }),
+  };
+  res.clearCookie('token', clearOpts);
+  res.clearCookie('has_session', { ...clearOpts, httpOnly: false });
+}
+
 function authenticateToken(req, res, next) {
   const authHeader = req.headers.authorization;
-  const token = authHeader?.split(' ')[1];
+  const token = req.cookies?.token || authHeader?.split(' ')[1];
 
   if (!token) return res.status(401).json({ error: 'Authentication required' });
 
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
     if (err) return res.status(403).json({ error: 'Invalid or expired token' });
+    if (user.jti && revokedJtis.has(user.jti)) {
+      return res.status(401).json({ error: 'Token has been revoked' });
+    }
     req.user = user;
+    req.token = token;
     // Attach the authenticated user to Sentry scope so every error from
     // this request is tagged with who triggered it
     Sentry.setUser({ id: user.id, email: user.email, username: user.name });
@@ -1108,15 +1384,27 @@ async function requireActivePlan(req, res, next) {
       return res.status(400).json({ error: 'No team selected' });
     }
 
-    // Fetch the team along with subscription, members, and report counts
-    const team = await prisma.team.findUnique({
-      where: { id: teamId },
-      include: {
-        subscription: true, // subscription relation
-        sites: { select: { _count: { select: { reports: true } } } },
-        members: true,
-      },
-    });
+    // Count of reports for this month (calendar month, UTC)
+    const now = new Date();
+    const startOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+
+    // Fetch the team along with subscription, members, and this-month report counts
+    const [team, monthlyReportCount] = await Promise.all([
+      prisma.team.findUnique({
+        where: { id: teamId },
+        include: {
+          subscription: true,
+          sites: { select: { id: true } },
+          members: true,
+        },
+      }),
+      prisma.qAReport.count({
+        where: {
+          site: { teamId },
+          createdAt: { gte: startOfMonth },
+        },
+      }),
+    ]);
 
     if (!team) {
       return res.status(404).json({ error: 'Team not found' });
@@ -1137,11 +1425,7 @@ async function requireActivePlan(req, res, next) {
       });
     }
 
-    // Count reports across all team sites
-    const totalReports = team.sites.reduce(
-      (sum, site) => sum + (site._count?.reports || 0),
-      0,
-    );
+    const totalReports = monthlyReportCount;
 
     // Enforce report limit
     if (totalReports >= limits.reports) {
@@ -1150,10 +1434,10 @@ async function requireActivePlan(req, res, next) {
       });
     }
 
-    // Enforce member limit
-    if (team.members.length > limits.members) {
+    // Enforce member limit (block invite when already at the limit)
+    if (team.members.length >= limits.members) {
       return res.status(403).json({
-        error: 'Member limit exceeded for this plan',
+        error: `Member limit reached for this plan (${limits.members} members)`,
       });
     }
 
@@ -1653,6 +1937,91 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 
 // POST /api/notifications/mark-seen — records that the user has seen all
 // notifications up to now, so the toast watcher doesn't replay them.
+// DELETE /teams/:teamId — permanently delete a team and all its data.
+// Only the team owner can do this. Cancels Stripe subscription and deletes R2 files.
+app.delete('/teams/:teamId', authenticateToken, async (req, res) => {
+  const { teamId } = req.params;
+  const callerId = req.user.id;
+
+  try {
+    // Only the owner may delete the team
+    const membership = await prisma.teamMember.findFirst({
+      where: { teamId, userId: callerId, role: 'owner' },
+    });
+    if (!membership) {
+      return res.status(403).json({ error: 'Only the team owner can delete this team' });
+    }
+
+    // Fetch everything we need to clean up
+    const team = await prisma.team.findUnique({
+      where: { id: teamId },
+      include: {
+        subscription: true,
+        sites: {
+          select: {
+            id: true,
+            reports: { select: { id: true, imagePath: true, videoPath: true } },
+          },
+        },
+      },
+    });
+    if (!team) return res.status(404).json({ error: 'Team not found' });
+
+    // 1. Cancel Stripe subscription if active
+    if (team.subscription?.stripeSubscriptionId) {
+      try {
+        await stripe.subscriptions.cancel(team.subscription.stripeSubscriptionId);
+      } catch (stripeErr) {
+        captureError('Stripe cancel on team delete failed', stripeErr);
+        // Non-fatal — continue with DB cleanup
+      }
+    }
+
+    // 2. Delete R2 objects for all reports across all team sites
+    const allReports = team.sites.flatMap((s) => s.reports);
+    const r2Keys = allReports.flatMap((r) => {
+      const keys = [];
+      if (r.imagePath) { const k = keyFromSignedUrl(r.imagePath); if (k) keys.push(k); }
+      if (r.videoPath) { const k = keyFromSignedUrl(r.videoPath); if (k) keys.push(k); }
+      return keys;
+    });
+    if (r2Keys.length) {
+      try { await deleteObjectsFromR2(r2Keys); } catch (r2Err) {
+        captureError('R2 cleanup on team delete failed', r2Err);
+      }
+    }
+
+    // 3. Delete all DB records in dependency order
+    const siteIds = team.sites.map((s) => s.id);
+    const reportIds = allReports.map((r) => r.id);
+
+    await prisma.$transaction([
+      // Reports and their children
+      prisma.attachment.deleteMany({ where: { qAReportId: { in: reportIds } } }),
+      prisma.comment.deleteMany({ where: { reportId: { in: reportIds } } }),
+      prisma.activity.deleteMany({ where: { reportId: { in: reportIds } } }),
+      prisma.qAReport.deleteMany({ where: { siteId: { in: siteIds } } }),
+      // Site-level
+      prisma.kanbanColumn.deleteMany({ where: { siteId: { in: siteIds } } }),
+      prisma.boardAccess.deleteMany({ where: { siteId: { in: siteIds } } }),
+      prisma.boardInvite.deleteMany({ where: { siteId: { in: siteIds } } }),
+      prisma.siteUser.deleteMany({ where: { siteId: { in: siteIds } } }),
+      prisma.notification.deleteMany({ where: { siteId: { in: siteIds } } }),
+      prisma.site.deleteMany({ where: { id: { in: siteIds } } }),
+      // Team-level
+      prisma.teamMember.deleteMany({ where: { teamId } }),
+      prisma.teamInvite.deleteMany({ where: { teamId } }),
+      prisma.subscription.deleteMany({ where: { teamId } }),
+      prisma.team.delete({ where: { id: teamId } }),
+    ]);
+
+    res.json({ deleted: true });
+  } catch (err) {
+    captureError('DELETE /teams/:teamId error', err);
+    res.status(500).json({ error: 'Failed to delete team' });
+  }
+});
+
 app.post('/api/notifications/mark-seen', authenticateToken, async (req, res) => {
   try {
     const updated = await prisma.user.update({
@@ -2444,7 +2813,9 @@ app.get('/api/site/:slug', authenticateToken, async (req, res) => {
   res.json(reports);
 });
 
-// GET /api/site/:slug/public-status — no auth required
+// GET /api/site/:slug/public-status — intentionally public (powers the /status/:slug page).
+// Slugs are generated from site names, not secrets; leaking aggregate report counts is
+// an accepted trade-off for the public-facing status board feature.
 app.get('/api/site/:slug/public-status', apiLimiter, async (req, res) => {
   try {
     const site = await prisma.site.findFirst({ where: { slug: req.params.slug } });
@@ -3963,38 +4334,29 @@ app.get('/api/team/:teamId/stats', authenticateToken, async (req, res) => {
         .json({ error: 'You are not a member of this team.' });
     }
 
-    // Single Prisma query: get counts of members, projects, and QAReports
-    const teamStats = await prisma.team.findUnique({
-      where: { id: teamId },
-      select: {
-        id: true,
-        _count: {
-          select: {
-            members: true, // team members
-            sites: true, // projects
-          },
+    const now = new Date();
+    const startOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+
+    // Fetch team counts + this month’s screenshot count in parallel
+    const [teamStats, screenshotsCount] = await Promise.all([
+      prisma.team.findUnique({
+        where: { id: teamId },
+        select: {
+          id: true,
+          _count: { select: { members: true, sites: true } },
         },
-        sites: {
-          select: {
-            _count: {
-              select: {
-                reports: true, // QAReports per site
-              },
-            },
-          },
+      }),
+      prisma.qAReport.count({
+        where: {
+          site: { teamId },
+          createdAt: { gte: startOfMonth },
         },
-      },
-    });
+      }),
+    ]);
 
     if (!teamStats) {
-      return res.status(404).json({ error: 'Team not found' });
+      return res.status(404).json({ error: "Team not found" });
     }
-
-    // Sum all QAReports across the team’s sites
-    const screenshotsCount = teamStats.sites.reduce(
-      (acc, site) => acc + site._count.reports,
-      0,
-    );
 
     return res.json({
       teamId: teamStats.id,
@@ -4610,6 +4972,15 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
 // ─── OAuth (Google & GitHub) ──────────────────────────────────────────────────
 
 app.get('/api/auth/google', (req, res) => {
+  const state = crypto.randomBytes(16).toString('hex');
+  const isProd = process.env.NODE_ENV === 'production';
+  res.cookie('oauth_state', state, {
+    httpOnly: true,
+    path: '/',
+    maxAge: 10 * 60 * 1000,
+    sameSite: 'lax',
+    ...(isProd && { secure: true }),
+  });
   const params = new URLSearchParams({
     client_id: process.env.GOOGLE_CLIENT_ID,
     redirect_uri: `${process.env.BACKEND_URL || `http://localhost:${PORT}`}/api/auth/google/callback`,
@@ -4617,13 +4988,21 @@ app.get('/api/auth/google', (req, res) => {
     scope: 'openid email profile',
     access_type: 'offline',
     prompt: 'select_account',
+    state,
   });
   res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`);
 });
 
 app.get('/api/auth/google/callback', async (req, res) => {
-  const { code, error } = req.query;
+  const { code, error, state } = req.query;
   const frontendUrl = process.env.APP_URL || 'http://localhost:3000';
+  const expectedState = req.cookies?.oauth_state;
+  const isProd = process.env.NODE_ENV === 'production';
+  res.clearCookie('oauth_state', { httpOnly: true, path: '/', sameSite: 'lax', ...(isProd && { secure: true }) });
+
+  if (!state || !expectedState || state !== expectedState) {
+    return res.redirect(`${frontendUrl}/callback?error=state_mismatch`);
+  }
 
   if (error || !code) {
     return res.redirect(`${frontendUrl}/callback?error=oauth_cancelled`);
@@ -4667,12 +5046,13 @@ app.get('/api/auth/google/callback', async (req, res) => {
     });
 
     const jwtToken = jwt.sign(
-      { id: user.id, email: user.email, name: user.name, teams: memberships },
+      { jti: crypto.randomUUID(), id: user.id, email: user.email, name: user.name, teams: memberships },
       process.env.JWT_SECRET,
       { expiresIn: '7d' },
     );
 
-    res.redirect(`${frontendUrl}/callback#token=${jwtToken}`); // H3 — use fragment to keep token out of Referer headers and server logs
+    setAuthCookie(res, jwtToken);
+    res.redirect(`${frontendUrl}/callback?success=1`);
   } catch (err) {
     captureError('Google OAuth error:', err?.response?.data || err.message);
     res.redirect(`${process.env.APP_URL || 'http://localhost:3000'}/callback?error=oauth_failed`);
@@ -4680,17 +5060,34 @@ app.get('/api/auth/google/callback', async (req, res) => {
 });
 
 app.get('/api/auth/github', (req, res) => {
+  const state = crypto.randomBytes(16).toString('hex');
+  const isProd = process.env.NODE_ENV === 'production';
+  res.cookie('oauth_state', state, {
+    httpOnly: true,
+    path: '/',
+    maxAge: 10 * 60 * 1000,
+    sameSite: 'lax',
+    ...(isProd && { secure: true }),
+  });
   const params = new URLSearchParams({
     client_id: process.env.GITHUB_CLIENT_ID,
     redirect_uri: `${process.env.BACKEND_URL || `http://localhost:${PORT}`}/api/auth/github/callback`,
     scope: 'user:email',
+    state,
   });
   res.redirect(`https://github.com/login/oauth/authorize?${params}`);
 });
 
 app.get('/api/auth/github/callback', async (req, res) => {
-  const { code, error } = req.query;
+  const { code, error, state } = req.query;
   const frontendUrl = process.env.APP_URL || 'http://localhost:3000';
+  const expectedState = req.cookies?.oauth_state;
+  const isProd = process.env.NODE_ENV === 'production';
+  res.clearCookie('oauth_state', { httpOnly: true, path: '/', sameSite: 'lax', ...(isProd && { secure: true }) });
+
+  if (!state || !expectedState || state !== expectedState) {
+    return res.redirect(`${frontendUrl}/callback?error=state_mismatch`);
+  }
 
   if (error || !code) {
     return res.redirect(`${frontendUrl}/callback?error=oauth_cancelled`);
@@ -4745,12 +5142,13 @@ app.get('/api/auth/github/callback', async (req, res) => {
     });
 
     const jwtToken = jwt.sign(
-      { id: user.id, email: user.email, name: user.name, teams: memberships },
+      { jti: crypto.randomUUID(), id: user.id, email: user.email, name: user.name, teams: memberships },
       process.env.JWT_SECRET,
       { expiresIn: '7d' },
     );
 
-    res.redirect(`${frontendUrl}/callback#token=${jwtToken}`); // H3 — use fragment to keep token out of Referer headers and server logs
+    setAuthCookie(res, jwtToken);
+    res.redirect(`${frontendUrl}/callback?success=1`);
   } catch (err) {
     captureError('GitHub OAuth error:', err?.response?.data || err.message);
     res.redirect(`${process.env.APP_URL || 'http://localhost:3000'}/callback?error=oauth_failed`);
@@ -4839,15 +5237,54 @@ app.patch('/api/users/me/notifications', authenticateToken, async (req, res) => 
   }
 });
 
-// DELETE /api/users/me — delete account (requires email confirmation)
+// DELETE /api/users/me — permanently delete a user account.
+// Requires email confirmation in the body.
+// Blocks if the user is the sole owner of any team (they must delete it first).
 app.delete('/api/users/me', authenticateToken, async (req, res) => {
   const { email } = req.body;
   if (!email || email !== req.user.email) {
     return res.status(400).json({ error: 'Email confirmation does not match' });
   }
 
+  const userId = req.user.id;
+
   try {
-    await prisma.user.delete({ where: { id: req.user.id } });
+    // Check for sole-owner teams — block deletion if found
+    const ownedTeams = await prisma.teamMember.findMany({
+      where: { userId, role: 'owner' },
+      select: {
+        teamId: true,
+        team: {
+          select: {
+            name: true,
+            _count: { select: { members: true } },
+            members: { where: { role: 'owner' }, select: { userId: true } },
+          },
+        },
+      },
+    });
+
+    const soleOwnerTeams = ownedTeams.filter(
+      (m) => m.team.members.length === 1 && m.team.members[0].userId === userId,
+    );
+
+    if (soleOwnerTeams.length > 0) {
+      const names = soleOwnerTeams.map((m) => `"${m.team.name}"`).join(', ');
+      return res.status(400).json({
+        error: `You are the sole owner of ${names}. Please delete your team or transfer ownership before deleting your account.`,
+        code: 'SOLE_OWNER',
+      });
+    }
+
+    // Remove all FK-blocking records for this user, then delete the user
+    await prisma.$transaction([
+      prisma.teamMember.deleteMany({ where: { userId } }),
+      prisma.siteUser.deleteMany({ where: { userId } }),
+      prisma.notification.deleteMany({ where: { userId } }),
+      prisma.activity.deleteMany({ where: { OR: [{ userId }, { actorId: userId }] } }),
+      prisma.user.delete({ where: { id: userId } }),
+    ]);
+
     res.json({ message: 'Account deleted' });
   } catch (err) {
     captureError('DELETE /api/users/me error:', err);
@@ -4879,9 +5316,16 @@ app.use((err, req, res, next) => {
   }
 });
 
-// Socket.io — authenticate via JWT handshake, join site rooms
+// Socket.io — authenticate via JWT from httpOnly cookie or auth handshake token
 io.use((socket, next) => {
-  const token = socket.handshake.auth?.token;
+  // Prefer cookie (set by setAuthCookie); fall back to explicit auth.token for backward compat
+  const cookieHeader = socket.handshake.headers?.cookie || '';
+  const cookieToken = cookieHeader
+    .split(';')
+    .map((c) => c.trim())
+    .find((c) => c.startsWith('token='))
+    ?.slice('token='.length);
+  const token = cookieToken || socket.handshake.auth?.token;
   if (!token) return next(new Error('Unauthorized'));
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
     if (err) return next(new Error('Unauthorized'));

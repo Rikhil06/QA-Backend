@@ -20,6 +20,7 @@
     "bcryptjs": "^3.0.2",
     "cheerio": "^1.1.0",
     "compression": "^1.8.1",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "crypto": "^1.0.1",
     "date-fns": "^4.1.0",
@@ -42,6 +43,7 @@
     "uuid": "^9.0.0"
   },
   "devDependencies": {
+    "@types/cookie-parser": "^1.4.10",
     "nodemon": "^3.1.11",
     "prisma": "^6.19.1"
   }

@@ -2,6 +2,8 @@ const {
   S3Client,
   PutObjectCommand,
   GetObjectCommand,
+  DeleteObjectCommand,
+  DeleteObjectsCommand,
 } = require('@aws-sdk/client-s3');
 
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
@@ -45,8 +47,52 @@ const generateThumbnail = async (buffer) => {
     .toBuffer();
 };
 
+// Extract the R2 object key from a signed URL.
+// Signed URLs look like: https://{account}.r2.cloudflarestorage.com/{bucket}/{key}?X-Amz-...
+function keyFromSignedUrl(signedUrl) {
+  try {
+    const u = new URL(signedUrl);
+    const bucket = process.env.R2_BUCKET_NAME;
+    // pathname is /{bucket}/{key...}
+    const prefix = `/${bucket}/`;
+    if (!u.pathname.startsWith(prefix)) return null;
+    return u.pathname.slice(prefix.length);
+  } catch {
+    return null;
+  }
+}
+
+const deleteObjectFromR2 = async (key) => {
+  await s3.send(
+    new DeleteObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key,
+    }),
+  );
+};
+
+// Delete multiple objects in one API call (batches of 1000 max).
+const deleteObjectsFromR2 = async (keys) => {
+  if (!keys.length) return;
+  const chunks = [];
+  for (let i = 0; i < keys.length; i += 1000) chunks.push(keys.slice(i, i + 1000));
+  await Promise.all(
+    chunks.map((chunk) =>
+      s3.send(
+        new DeleteObjectsCommand({
+          Bucket: process.env.R2_BUCKET_NAME,
+          Delete: { Objects: chunk.map((Key) => ({ Key })), Quiet: true },
+        }),
+      ),
+    ),
+  );
+};
+
 module.exports = {
   getSignedR2Url,
   generateThumbnail,
   uploadBufferToR2,
+  deleteObjectFromR2,
+  deleteObjectsFromR2,
+  keyFromSignedUrl,
 };
