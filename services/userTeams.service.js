@@ -35,6 +35,7 @@ async function getOwnerTeams(userId) {
       teamMembers: {
         where: { role: 'owner' },
         select: {
+          role: true,
           team: {
             select: {
               id: true,
@@ -72,6 +73,7 @@ async function getMemberTeams(userId) {
       teamMembers: {
         where: { role: 'member' },
         select: {
+          role: true,
           team: {
             select: {
               id: true,

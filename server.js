@@ -1908,41 +1908,47 @@ app.delete('/teams/:teamId/members/:userId', authenticateToken, async (req, res)
 
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   const userId = req.user.id;
-  const user = await getUserTeams(userId);
 
-  if (!user) return res.sendStatus(404);
+  try {
+    const user = await getUserTeams(userId);
 
-  // 👇 pick the first owned team (you could expand this for multiple teams)
-  const ownedTeam = user.teamMembers?.[0]?.team ?? null;
-  const teamId = ownedTeam?.id ?? null;
-  const isOwner = Boolean(teamId);
+    if (!user) return res.sendStatus(404);
 
-  // Update last active
-  await prisma.user.update({
-    where: { id: req.user.id },
-    data: { lastActive: new Date() },
-  });
+    const firstMembership = user.teamMembers?.[0] ?? null;
+    const ownedTeam = firstMembership?.team ?? null;
+    const teamId = ownedTeam?.id ?? null;
+    const isOwner = firstMembership?.role === 'owner';
 
-  res.json({
-    user: {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      teamId,
-      team: ownedTeam
-        ? {
-            id: ownedTeam.id,
-            name: ownedTeam.name,
-            plan: ownedTeam.plan,
-            subscription: ownedTeam.subscription ?? null,
-          }
-        : null,
-      role: isOwner ? 'owner' : 'member',
-      emailVerified: !!user.emailVerified,
-      notificationPrefs: user.notificationPrefs ?? null,
-      lastSeenNotificationsAt: user.lastSeenNotificationsAt ?? null,
-    },
-  });
+    // Update last active
+    await prisma.user.update({
+      where: { id: req.user.id },
+      data: { lastActive: new Date() },
+    });
+
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        teamId,
+        team: ownedTeam
+          ? {
+              id: ownedTeam.id,
+              name: ownedTeam.name,
+              plan: ownedTeam.plan,
+              subscription: ownedTeam.subscription ?? null,
+            }
+          : null,
+        role: isOwner ? 'owner' : 'member',
+        emailVerified: !!user.emailVerified,
+        notificationPrefs: user.notificationPrefs ?? null,
+        lastSeenNotificationsAt: user.lastSeenNotificationsAt ?? null,
+      },
+    });
+  } catch (error) {
+    captureError('Failed to get current user:', error);
+    res.status(500).json({ error: 'Failed to get user' });
+  }
 });
 
 // POST /api/notifications/mark-seen — records that the user has seen all
@@ -2802,25 +2808,30 @@ app.get('/api/site/:slug', authenticateToken, async (req, res) => {
   const { slug } = req.params;
   const { teamId } = req.query;
 
-  const siteExists = await prisma.site.findFirst({
-    where: { OR: [{ slug }, { domain: slug }] },
-    select: { id: true },
-  });
-  if (!siteExists) {
-    return res.status(404).json({ error: 'Site not found' });
+  try {
+    const siteExists = await prisma.site.findFirst({
+      where: { OR: [{ slug }, { domain: slug }] },
+      select: { id: true },
+    });
+    if (!siteExists) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+
+    const site = await resolveSiteForUser(slug, teamId, req.user.id);
+    if (!site) {
+      return res.status(403).json({ error: 'Access denied to this site' });
+    }
+
+    const reports = await prisma.qAReport.findMany({
+      where: { siteId: site.id },
+      orderBy: { timestamp: 'desc' },
+    });
+
+    res.json(reports);
+  } catch (error) {
+    captureError('Failed to get site reports:', error);
+    res.status(500).json({ error: 'Failed to get site' });
   }
-
-  const site = await resolveSiteForUser(slug, teamId, req.user.id);
-  if (!site) {
-    return res.status(403).json({ error: 'Access denied to this site' });
-  }
-
-  const reports = await prisma.qAReport.findMany({
-    where: { siteId: site.id },
-    orderBy: { timestamp: 'desc' },
-  });
-
-  res.json(reports);
 });
 
 // GET /api/site/:slug/public-status — intentionally public (powers the /status/:slug page).
@@ -4328,7 +4339,7 @@ app.delete('/api/report/:id', authenticateToken, async (req, res) => {
 });
 
 // Returns canonical plan limits — frontend uses this as single source of truth
-app.get('/api/plan-limits', (req, res) => {
+app.get('/api/plan-limits', authenticateToken, (req, res) => {
   // Replace Infinity with null so JSON serialisation works
   const serialisable = Object.fromEntries(
     Object.entries(PLAN_LIMITS).map(([plan, limits]) => [
@@ -4393,27 +4404,32 @@ app.get('/api/team/:teamId/stats', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/teams', authenticateToken, async (req, res) => {
-  const teams = await prisma.team.findMany({
-    where: {
-      members: {
-        some: { userId: req.user.id },
-      },
-    },
-    include: {
-      members: {
-        include: {
-          user: { select: { id: true, name: true, email: true } },
+  try {
+    const teams = await prisma.team.findMany({
+      where: {
+        members: {
+          some: { userId: req.user.id },
         },
       },
-    },
-  });
+      include: {
+        members: {
+          include: {
+            user: { select: { id: true, name: true, email: true } },
+          },
+        },
+      },
+    });
 
-  await prisma.user.update({
-    where: { id: req.user.id },
-    data: { lastActive: new Date() },
-  });
+    await prisma.user.update({
+      where: { id: req.user.id },
+      data: { lastActive: new Date() },
+    });
 
-  res.json(teams);
+    res.json(teams);
+  } catch (error) {
+    captureError('Failed to get teams:', error);
+    res.status(500).json({ error: 'Failed to get teams' });
+  }
 });
 
 app.post('/billing/checkout', authenticateToken, async (req, res) => {
@@ -5335,8 +5351,18 @@ app.delete('/api/users/me', authenticateToken, async (req, res) => {
       });
     }
 
-    // Remove all FK-blocking records for this user, then delete the user
+    // Revoke the active session before deleting so the cookie becomes immediately invalid
+    if (req.user.jti) revokedJtis.add(req.user.jti);
+
+    // Remove all FK-blocking records for this user, then delete the user.
+    // Reports on shared team boards are anonymised rather than deleted to preserve team QA history.
     await prisma.$transaction([
+      // Anonymise reports so team boards keep their cards but PII is removed
+      prisma.qAReport.updateMany({
+        where: { userId },
+        data: { userId: null, userName: 'Deleted User' },
+      }),
+      prisma.comment.deleteMany({ where: { userId } }),
       prisma.teamMember.deleteMany({ where: { userId } }),
       prisma.siteUser.deleteMany({ where: { userId } }),
       prisma.notification.deleteMany({ where: { userId } }),
@@ -5344,6 +5370,7 @@ app.delete('/api/users/me', authenticateToken, async (req, res) => {
       prisma.user.delete({ where: { id: userId } }),
     ]);
 
+    clearAuthCookie(res);
     res.json({ message: 'Account deleted' });
   } catch (err) {
     captureError('DELETE /api/users/me error:', err);
