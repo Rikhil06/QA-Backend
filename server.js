@@ -175,8 +175,13 @@ function mapPriceToPlan(priceId) {
 }
 
 app.get('/stripe/account', authenticateToken, async (req, res) => {
-  const email = await getStripeAccountEmail();
-  res.json({ email });
+  try {
+    const email = await getStripeAccountEmail();
+    res.json({ email });
+  } catch (err) {
+    captureError('stripe/account error:', err);
+    res.status(500).json({ error: 'Failed to fetch billing account' });
+  }
 });
 
 app.post(
@@ -1710,45 +1715,21 @@ app.post(
 
     const inviteUrl = `${process.env.APP_URL}/invite/${code}`;
 
-    const emailHtml = `
-    <div style="font-family: Arial, sans-serif; line-height: 1.6;">
-      <h2>You’ve been invited to join <strong>${
-        team.name
-      }</strong> on QA Tool</h2>
-
-      <p><strong>${inviterName}</strong> has invited you to collaborate on their QA workspace.</p>
-
-      <p>QA Tool helps teams capture website issues visually, add comments, and send them
-      straight into a shared Kanban board — making QA faster and more collaborative.</p>
-
-      <p style="margin-top: 16px;">
-        <a href="${inviteUrl}"
-          style="background:#2563eb;color:#fff;padding:10px 14px;border-radius:6px;
-          text-decoration:none;display:inline-block;">
-          Accept invite and join the team
-        </a>
-      </p>
-
-      <p>If the button doesn’t work, copy and paste this link:</p>
-      <p>${inviteUrl}</p>
-
-      <p style="color:#666;font-size:13px;">
-        This invite will expire on <strong>${expiresAt.toLocaleDateString()}</strong>.
-      </p>
-
-      <hr />
-
-      <p style="color:#777;font-size:12px;">
-        You’re receiving this because someone added your email to a QA Tool team invite.
-        If you weren’t expecting this, you can safely ignore it.
-      </p>
-    </div>
-  `;
+    const emailHtml = emailTemplate({
+      badgeText: ‘Team Invite’,
+      heading: `You’ve been invited to join ${team.name}`,
+      body: `<p><strong style="color:#fff;">${inviterName}</strong> has invited you to collaborate on their QA workspace.</p>
+             <p style="margin-top:12px;">Annoture helps teams capture website bugs visually, add comments, and manage them on a shared Kanban board.</p>
+             <p style="margin-top:16px;font-size:12px;color:rgba(255,255,255,0.3);">This invite expires on <strong style="color:rgba(255,255,255,0.5);">${expiresAt.toLocaleDateString()}</strong>.</p>`,
+      ctaUrl: inviteUrl,
+      ctaLabel: ‘Accept invite and join the team’,
+      footerNote: "You’re receiving this because someone added your email to an Annoture team invite. If you weren’t expecting this, you can safely ignore it.",
+    });
 
     await resend.emails.send({
       from: process.env.EMAIL_FROM || 'Annoture <onboarding@resend.dev>',
       to: email,
-      subject: `You’ve been invited to join ${team.name} on QA Tool`,
+      subject: `You’ve been invited to join ${team.name} on Annoture`,
       html: emailHtml,
     });
 
@@ -3000,29 +2981,15 @@ app.post('/api/site/:slug/share', authenticateToken, async (req, res) => {
       from: fromAddress,
       to: email,
       subject: `${inviterName} shared a board with you on Annoture`,
-      html: `
-        <div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto;background:#0f0f0f;color:#f5f5f5;border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,0.08)">
-          <div style="padding:32px">
-            <div style="display:inline-flex;align-items:center;gap:10px;margin-bottom:24px">
-              <div style="width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#8B5CF6,#6366F1);display:flex;align-items:center;justify-content:center">
-                <span style="color:white;font-size:16px">✓</span>
-              </div>
-              <span style="font-weight:600;font-size:16px">Annoture</span>
-            </div>
-            <h2 style="margin:0 0 8px;font-size:20px;font-weight:600">${inviterName} invited you to view a board</h2>
-            <p style="color:rgba(255,255,255,0.5);margin:0 0 24px;font-size:14px">
-              You've been given <strong style="color:#a78bfa">${roleName}</strong> access to the
-              <strong style="color:#f5f5f5">${site.name}</strong> board.
-            </p>
-            <a href="${inviteUrl}" style="display:inline-block;background:linear-gradient(135deg,#7C3AED,#6366F1);color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px">
-              Open board →
-            </a>
-            <p style="color:rgba(255,255,255,0.3);font-size:12px;margin-top:24px">
-              This invite expires on ${expiresAt.toLocaleDateString()}. If you weren't expecting this, you can safely ignore it.
-            </p>
-          </div>
-        </div>
-      `,
+      html: emailTemplate({
+        badgeText: 'Board Access',
+        heading: `${inviterName} invited you to view a board`,
+        body: `<p>You've been given <strong style="color:#a78bfa;">${roleName}</strong> access to the <strong style="color:#fff;">${site.name}</strong> board.</p>
+               <p style="margin-top:16px;font-size:12px;color:rgba(255,255,255,0.3);">This invite expires on <strong style="color:rgba(255,255,255,0.5);">${expiresAt.toLocaleDateString()}</strong>.</p>`,
+        ctaUrl: inviteUrl,
+        ctaLabel: 'Open board',
+        footerNote: "If you weren't expecting this invite, you can safely ignore it.",
+      }),
     }).then(({ error }) => {
       if (error) captureError('board share email error:', error);
     }).catch((err) => captureError('board share email exception:', err));
@@ -4948,12 +4915,17 @@ app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
 
     if (!resend) return;
     await resend.emails.send({
-      from: process.env.EMAIL_FROM || 'noreply@yourdomain.com',
+      from: process.env.EMAIL_FROM || 'Annoture <noreply@annoture.com>',
       to: email,
-      subject: 'Reset your password',
-      html: `<p>Click the link below to reset your password. It expires in 1 hour.</p>
-             <p><a href="${resetUrl}">${resetUrl}</a></p>
-             <p>If you didn't request this, you can ignore this email.</p>`,
+      subject: 'Reset your Annoture password',
+      html: emailTemplate({
+        badgeText: 'Password Reset',
+        heading: 'Reset your password',
+        body: '<p>Click the button below to reset your password. This link expires in <strong style="color:#fff;">1 hour</strong>.</p>',
+        ctaUrl: resetUrl,
+        ctaLabel: 'Reset password',
+        footerNote: "If you didn't request a password reset, you can safely ignore this email — your password won't change.",
+      }),
     });
   } catch (err) {
     captureError('forgot-password error:', err);
