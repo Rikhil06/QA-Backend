@@ -1716,20 +1716,20 @@ app.post(
     const inviteUrl = `${process.env.APP_URL}/invite/${code}`;
 
     const emailHtml = emailTemplate({
-      badgeText: ‘Team Invite’,
-      heading: `You’ve been invited to join ${team.name}`,
+      badgeText: 'Team Invite',
+      heading: `You've been invited to join ${team.name}`,
       body: `<p><strong style="color:#fff;">${inviterName}</strong> has invited you to collaborate on their QA workspace.</p>
              <p style="margin-top:12px;">Annoture helps teams capture website bugs visually, add comments, and manage them on a shared Kanban board.</p>
              <p style="margin-top:16px;font-size:12px;color:rgba(255,255,255,0.3);">This invite expires on <strong style="color:rgba(255,255,255,0.5);">${expiresAt.toLocaleDateString()}</strong>.</p>`,
       ctaUrl: inviteUrl,
-      ctaLabel: ‘Accept invite and join the team’,
-      footerNote: "You’re receiving this because someone added your email to an Annoture team invite. If you weren’t expecting this, you can safely ignore it.",
+      ctaLabel: 'Accept invite and join the team',
+      footerNote: "You're receiving this because someone added your email to an Annoture team invite. If you weren't expecting this, you can safely ignore it.",
     });
 
     await resend.emails.send({
       from: process.env.EMAIL_FROM || 'Annoture <onboarding@resend.dev>',
       to: email,
-      subject: `You’ve been invited to join ${team.name} on Annoture`,
+      subject: `You've been invited to join ${team.name} on Annoture`,
       html: emailHtml,
     });
 
@@ -4283,7 +4283,7 @@ app.get('/api/team/:teamId/stats', authenticateToken, async (req, res) => {
     const now = new Date();
     const startOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
 
-    // Fetch team counts + this month’s screenshot count in parallel
+    // Fetch team counts + this month's screenshot count in parallel
     const [teamStats, screenshotsCount] = await Promise.all([
       prisma.team.findUnique({
         where: { id: teamId },
