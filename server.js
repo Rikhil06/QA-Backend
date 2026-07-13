@@ -2155,6 +2155,38 @@ app.post(
       // Respond immediately — fire remaining tasks without blocking
       res.json(report);
 
+      // Non-blocking: create GitHub issue if this site has the integration enabled
+      if (report.siteId) {
+        (async () => {
+          try {
+            const ghConfig = await prisma.siteGitHubConfig.findUnique({
+              where: { siteId: report.siteId },
+              include: { integration: true },
+            });
+            if (ghConfig && ghConfig.enabled) {
+              const issue = await createGitHubIssue(
+                ghConfig.integration.accessToken,
+                ghConfig.repoOwner,
+                ghConfig.repoName,
+                report,
+              );
+              await prisma.qAReport.update({
+                where: { id: report.id },
+                data: { githubIssueNumber: issue.number, githubIssueUrl: issue.url },
+              });
+              io.to(`site:${slug}`).emit('board:event', {
+                type: 'report:updated',
+                reportId: report.id,
+                githubIssueNumber: issue.number,
+                githubIssueUrl: issue.url,
+              });
+            }
+          } catch (err) {
+            captureError('GitHub issue auto-create failed:', err?.response?.data || err.message);
+          }
+        })();
+      }
+
       // Invalidate cached stats + sites for this user so dashboard reflects new report
       invalidateUserStats(req.user.id);
       invalidateUserSites(req.user.id);
@@ -2336,6 +2368,8 @@ app.get('/api/report/:id', authenticateToken, async (req, res) => {
         cssPath: true,
         consoleLogs: true,
         videoPath: true,
+        githubIssueNumber: true,
+        githubIssueUrl: true,
       },
     });
 
@@ -2772,6 +2806,21 @@ app.get('/api/archive', authenticateToken, async (req, res) => {
 });
 
 // GET /api/site/:site
+// GET /api/site/:slug/meta — lightweight: returns site id + name for settings pages
+app.get('/api/site/:slug/meta', authenticateToken, async (req, res) => {
+  try {
+    const site = await prisma.site.findFirst({
+      where: { OR: [{ slug: req.params.slug }, { domain: req.params.slug }] },
+      select: { id: true, name: true, domain: true, slug: true },
+    });
+    if (!site) return res.status(404).json({ error: 'Site not found' });
+    res.json(site);
+  } catch (err) {
+    captureError('Site meta error:', err);
+    res.status(500).json({ error: 'Failed to fetch site' });
+  }
+});
+
 app.get('/api/site/:slug', authenticateToken, async (req, res) => {
   const { slug } = req.params;
   const { teamId } = req.query;
@@ -5145,6 +5194,252 @@ app.get('/api/auth/github/callback', async (req, res) => {
   } catch (err) {
     captureError('GitHub OAuth error:', err?.response?.data || err.message);
     res.redirect(`${process.env.APP_URL || 'http://localhost:3000'}/callback?error=oauth_failed`);
+  }
+});
+
+// ─── GitHub Integration ────────────────────────────────────────────────────────
+
+// Helper: create a GitHub issue for a report
+async function createGitHubIssue(accessToken, repoOwner, repoName, report) {
+  const body = [
+    `**URL:** ${report.url}`,
+    `**Page:** ${report.pagePath || '/'}`,
+    report.browser ? `**Browser:** ${report.browser}` : null,
+    report.os ? `**OS:** ${report.os}` : null,
+    report.viewport ? `**Viewport:** ${report.viewport}` : null,
+    report.cssPath ? `**Element:** \`${report.cssPath}\`` : null,
+    '',
+    `**Description:**`,
+    report.comment,
+    '',
+    `---`,
+    `*Captured via [Annoture](https://annoture.com) by ${report.userName}*`,
+  ].filter((l) => l !== null).join('\n');
+
+  const labels = [];
+  if (report.type === 'bug') labels.push('bug');
+  if (report.priority === 'urgent' || report.priority === 'high') labels.push('priority: high');
+
+  const issueRes = await axios.post(
+    `https://api.github.com/repos/${repoOwner}/${repoName}/issues`,
+    { title: report.title, body, labels },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    },
+  );
+  return { number: issueRes.data.number, url: issueRes.data.html_url };
+}
+
+// GET /api/github/connect — initiate OAuth with repo scope
+app.get('/api/github/connect', authenticateToken, (req, res) => {
+  const { siteSlug } = req.query;
+  const state = crypto.randomBytes(16).toString('hex');
+  const isProd = process.env.NODE_ENV === 'production';
+  const cookieOpts = { httpOnly: true, path: '/', maxAge: 10 * 60 * 1000, sameSite: 'lax', ...(isProd && { secure: true }) };
+  res.cookie('gh_int_state', state, cookieOpts);
+  if (siteSlug) res.cookie('gh_int_return', siteSlug, cookieOpts);
+  const params = new URLSearchParams({
+    client_id: process.env.GITHUB_INTEGRATION_CLIENT_ID || process.env.GITHUB_CLIENT_ID,
+    redirect_uri: `${process.env.BACKEND_URL || `http://localhost:${PORT}`}/api/github/connect/callback`,
+    scope: 'repo',
+    state,
+  });
+  res.redirect(`https://github.com/login/oauth/authorize?${params}`);
+});
+
+// GET /api/github/connect/callback — exchange code, store repo-scoped token
+app.get('/api/github/connect/callback', async (req, res) => {
+  const { code, error, state } = req.query;
+  const frontendUrl = process.env.APP_URL || 'http://localhost:3000';
+  const expectedState = req.cookies?.gh_int_state;
+  const returnSlug = req.cookies?.gh_int_return || '';
+  const isProd = process.env.NODE_ENV === 'production';
+  const clearOpts = { httpOnly: true, path: '/', sameSite: 'lax', ...(isProd && { secure: true }) };
+  res.clearCookie('gh_int_state', clearOpts);
+  res.clearCookie('gh_int_return', clearOpts);
+
+  if (!state || !expectedState || state !== expectedState) {
+    return res.redirect(`${frontendUrl}/reports/${returnSlug}/settings?github=error`);
+  }
+  if (error || !code) {
+    return res.redirect(`${frontendUrl}/reports/${returnSlug}/settings?github=cancelled`);
+  }
+
+  // We need the user id — verify the session cookie JWT directly
+  const token = req.cookies?.token;
+  if (!token) return res.redirect(`${frontendUrl}/login?next=/reports/${returnSlug}/settings`);
+  let userId;
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    userId = payload.id;
+  } catch {
+    return res.redirect(`${frontendUrl}/login?next=/reports/${returnSlug}/settings`);
+  }
+
+  try {
+    const tokenRes = await axios.post(
+      'https://github.com/login/oauth/access_token',
+      {
+        client_id: process.env.GITHUB_INTEGRATION_CLIENT_ID || process.env.GITHUB_CLIENT_ID,
+        client_secret: process.env.GITHUB_INTEGRATION_CLIENT_SECRET || process.env.GITHUB_CLIENT_SECRET,
+        code,
+        redirect_uri: `${process.env.BACKEND_URL || `http://localhost:${PORT}`}/api/github/connect/callback`,
+      },
+      { headers: { Accept: 'application/json' } },
+    );
+
+    const accessToken = tokenRes.data.access_token;
+    if (!accessToken) return res.redirect(`${frontendUrl}/reports/${returnSlug}/settings?github=error`);
+
+    const profileRes = await axios.get('https://api.github.com/user', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    const githubLogin = profileRes.data.login;
+
+    await prisma.gitHubIntegration.upsert({
+      where: { userId },
+      update: { accessToken, githubLogin, updatedAt: new Date() },
+      create: { userId, accessToken, githubLogin },
+    });
+
+    res.redirect(`${frontendUrl}/reports/${returnSlug}/settings?github=connected`);
+  } catch (err) {
+    captureError('GitHub integration OAuth error:', err?.response?.data || err.message);
+    res.redirect(`${frontendUrl}/reports/${returnSlug}/settings?github=error`);
+  }
+});
+
+// GET /api/github/status — check if the current user has a GitHub integration
+app.get('/api/github/status', authenticateToken, async (req, res) => {
+  try {
+    const integration = await prisma.gitHubIntegration.findUnique({
+      where: { userId: req.user.id },
+      select: { id: true, githubLogin: true, createdAt: true },
+    });
+    res.json({ connected: !!integration, githubLogin: integration?.githubLogin || null });
+  } catch (err) {
+    captureError('GitHub status error:', err);
+    res.status(500).json({ error: 'Failed to check GitHub status' });
+  }
+});
+
+// DELETE /api/github/disconnect — remove the integration
+app.delete('/api/github/disconnect', authenticateToken, async (req, res) => {
+  try {
+    await prisma.gitHubIntegration.deleteMany({ where: { userId: req.user.id } });
+    res.json({ ok: true });
+  } catch (err) {
+    captureError('GitHub disconnect error:', err);
+    res.status(500).json({ error: 'Failed to disconnect' });
+  }
+});
+
+// GET /api/github/repos — list repos for the connected account
+app.get('/api/github/repos', authenticateToken, async (req, res) => {
+  try {
+    const integration = await prisma.gitHubIntegration.findUnique({ where: { userId: req.user.id } });
+    if (!integration) return res.status(404).json({ error: 'GitHub not connected' });
+
+    // Fetch all repos (handles pagination for users with many repos)
+    let repos = [];
+    let page = 1;
+    while (true) {
+      const r = await axios.get(`https://api.github.com/user/repos?per_page=100&page=${page}&sort=updated`, {
+        headers: { Authorization: `Bearer ${integration.accessToken}`, Accept: 'application/vnd.github+json' },
+      });
+      if (!r.data.length) break;
+      repos = repos.concat(r.data.map((repo) => ({
+        id: repo.id,
+        fullName: repo.full_name,
+        owner: repo.owner.login,
+        name: repo.name,
+        private: repo.private,
+        updatedAt: repo.updated_at,
+      })));
+      if (r.data.length < 100) break;
+      page++;
+    }
+    res.json(repos);
+  } catch (err) {
+    captureError('GitHub repos error:', err?.response?.data || err.message);
+    if (err?.response?.status === 401) return res.status(401).json({ error: 'GitHub token expired — please reconnect' });
+    res.status(500).json({ error: 'Failed to fetch repos' });
+  }
+});
+
+// GET /api/github/sites/:siteId/integration — get site's GitHub config
+app.get('/api/github/sites/:siteId/integration', authenticateToken, async (req, res) => {
+  try {
+    const config = await prisma.siteGitHubConfig.findUnique({
+      where: { siteId: req.params.siteId },
+      select: { repoOwner: true, repoName: true, enabled: true },
+    });
+    res.json(config || null);
+  } catch (err) {
+    captureError('GitHub site config fetch error:', err);
+    res.status(500).json({ error: 'Failed to fetch integration' });
+  }
+});
+
+// POST /api/github/sites/:siteId/integration — save site's GitHub config
+app.post('/api/github/sites/:siteId/integration', authenticateToken, async (req, res) => {
+  const { repoOwner, repoName, enabled = true } = req.body;
+  if (!repoOwner || !repoName) return res.status(400).json({ error: 'repoOwner and repoName are required' });
+  try {
+    const integration = await prisma.gitHubIntegration.findUnique({ where: { userId: req.user.id } });
+    if (!integration) return res.status(404).json({ error: 'GitHub not connected' });
+
+    const config = await prisma.siteGitHubConfig.upsert({
+      where: { siteId: req.params.siteId },
+      update: { repoOwner, repoName, enabled, integrationId: integration.id },
+      create: { siteId: req.params.siteId, repoOwner, repoName, enabled, integrationId: integration.id },
+    });
+    res.json(config);
+  } catch (err) {
+    captureError('GitHub site config save error:', err);
+    res.status(500).json({ error: 'Failed to save integration' });
+  }
+});
+
+// DELETE /api/github/sites/:siteId/integration — remove site's GitHub config
+app.delete('/api/github/sites/:siteId/integration', authenticateToken, async (req, res) => {
+  try {
+    await prisma.siteGitHubConfig.deleteMany({ where: { siteId: req.params.siteId } });
+    res.json({ ok: true });
+  } catch (err) {
+    captureError('GitHub site config delete error:', err);
+    res.status(500).json({ error: 'Failed to remove integration' });
+  }
+});
+
+// POST /api/github/sites/:siteId/push/:reportId — manually push an existing report to GitHub
+app.post('/api/github/sites/:siteId/push/:reportId', authenticateToken, async (req, res) => {
+  try {
+    const integration = await prisma.gitHubIntegration.findUnique({ where: { userId: req.user.id } });
+    if (!integration) return res.status(404).json({ error: 'GitHub not connected' });
+
+    const config = await prisma.siteGitHubConfig.findUnique({ where: { siteId: req.params.siteId } });
+    if (!config || !config.enabled) return res.status(404).json({ error: 'GitHub integration not configured for this site' });
+
+    const report = await prisma.qAReport.findUnique({ where: { id: req.params.reportId } });
+    if (!report) return res.status(404).json({ error: 'Report not found' });
+    if (report.githubIssueUrl) return res.status(409).json({ error: 'Report already pushed to GitHub', url: report.githubIssueUrl });
+
+    const issue = await createGitHubIssue(integration.accessToken, config.repoOwner, config.repoName, report);
+    const updated = await prisma.qAReport.update({
+      where: { id: report.id },
+      data: { githubIssueNumber: issue.number, githubIssueUrl: issue.url },
+    });
+    res.json({ githubIssueNumber: updated.githubIssueNumber, githubIssueUrl: updated.githubIssueUrl });
+  } catch (err) {
+    captureError('GitHub push error:', err?.response?.data || err.message);
+    if (err?.response?.status === 401) return res.status(401).json({ error: 'GitHub token expired — please reconnect' });
+    if (err?.response?.status === 404) return res.status(404).json({ error: 'Repo not found or no access' });
+    res.status(500).json({ error: 'Failed to create GitHub issue' });
   }
 });
 
