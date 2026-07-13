@@ -1405,8 +1405,8 @@ async function requireActivePlan(req, res, next) {
       }),
       prisma.qAReport.count({
         where: {
-          site: { teamId },
-          createdAt: { gte: startOfMonth },
+          Site: { teamId },
+          timestamp: { gte: startOfMonth },
         },
       }),
     ]);
@@ -4343,8 +4343,8 @@ app.get('/api/team/:teamId/stats', authenticateToken, async (req, res) => {
       }),
       prisma.qAReport.count({
         where: {
-          site: { teamId },
-          createdAt: { gte: startOfMonth },
+          Site: { teamId },
+          timestamp: { gte: startOfMonth },
         },
       }),
     ]);
