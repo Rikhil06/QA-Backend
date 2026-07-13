@@ -5201,7 +5201,11 @@ app.get('/api/auth/github/callback', async (req, res) => {
 
 // Helper: create a GitHub issue for a report
 async function createGitHubIssue(accessToken, repoOwner, repoName, report) {
+  const screenshotUrl = report.imagePath ? await refreshR2Url(report.imagePath) : null;
+
   const body = [
+    screenshotUrl ? `![Screenshot](${screenshotUrl})` : null,
+    screenshotUrl ? '' : null,
     `**URL:** ${report.url}`,
     `**Page:** ${report.pagePath || '/'}`,
     report.browser ? `**Browser:** ${report.browser}` : null,
