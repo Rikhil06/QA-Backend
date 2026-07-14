@@ -2155,7 +2155,7 @@ app.post(
       // Respond immediately — fire remaining tasks without blocking
       res.json(report);
 
-      // Non-blocking: create GitHub issue if this site has the integration enabled
+      // Non-blocking: create GitHub + Jira issues if integrations are enabled
       if (report.siteId) {
         (async () => {
           try {
@@ -2183,6 +2183,38 @@ app.post(
             }
           } catch (err) {
             captureError('GitHub issue auto-create failed:', err?.response?.data || err.message);
+          }
+        })();
+
+        // Jira
+        (async () => {
+          try {
+            const jiraConfig = await prisma.siteJiraConfig.findUnique({
+              where: { siteId: report.siteId },
+              include: { integration: true },
+            });
+            if (jiraConfig && jiraConfig.enabled) {
+              const issue = await createJiraIssue(
+                jiraConfig.integration,
+                jiraConfig.cloudId,
+                jiraConfig.cloudUrl,
+                jiraConfig.projectKey,
+                jiraConfig.issueType,
+                report,
+              );
+              await prisma.qAReport.update({
+                where: { id: report.id },
+                data: { jiraIssueKey: issue.key, jiraIssueUrl: issue.url },
+              });
+              io.to(`site:${slug}`).emit('board:event', {
+                type: 'report:updated',
+                reportId: report.id,
+                jiraIssueKey: issue.key,
+                jiraIssueUrl: issue.url,
+              });
+            }
+          } catch (err) {
+            captureError('Jira issue auto-create failed:', err?.response?.data || err.message);
           }
         })();
       }
@@ -2370,6 +2402,8 @@ app.get('/api/report/:id', authenticateToken, async (req, res) => {
         videoPath: true,
         githubIssueNumber: true,
         githubIssueUrl: true,
+        jiraIssueKey: true,
+        jiraIssueUrl: true,
       },
     });
 
@@ -5444,6 +5478,299 @@ app.post('/api/github/sites/:siteId/push/:reportId', authenticateToken, async (r
     if (err?.response?.status === 401) return res.status(401).json({ error: 'GitHub token expired — please reconnect' });
     if (err?.response?.status === 404) return res.status(404).json({ error: 'Repo not found or no access' });
     res.status(500).json({ error: 'Failed to create GitHub issue' });
+  }
+});
+
+// ─── Jira Integration ─────────────────────────────────────────────────────────
+
+async function getValidJiraToken(integration) {
+  if (new Date() < new Date(integration.expiresAt)) return integration.accessToken;
+  const tokenRes = await axios.post(
+    'https://auth.atlassian.com/oauth/token',
+    {
+      grant_type: 'refresh_token',
+      client_id: process.env.JIRA_CLIENT_ID,
+      client_secret: process.env.JIRA_CLIENT_SECRET,
+      refresh_token: integration.refreshToken,
+    },
+    { headers: { 'Content-Type': 'application/json' } },
+  );
+  const { access_token, refresh_token, expires_in } = tokenRes.data;
+  const expiresAt = new Date(Date.now() + expires_in * 1000 - 60_000); // 1 min buffer
+  await prisma.jiraIntegration.update({
+    where: { id: integration.id },
+    data: { accessToken: access_token, refreshToken: refresh_token || integration.refreshToken, expiresAt },
+  });
+  return access_token;
+}
+
+async function createJiraIssue(integration, cloudId, cloudUrl, projectKey, issueType, report) {
+  const token = await getValidJiraToken(integration);
+  const screenshotUrl = report.imagePath ? await refreshR2Url(report.imagePath) : null;
+
+  // Build description in Atlassian Document Format (ADF)
+  const textLine = (label, value) => ({
+    type: 'paragraph',
+    content: [
+      { type: 'text', text: `${label}: `, marks: [{ type: 'strong' }] },
+      { type: 'text', text: value },
+    ],
+  });
+
+  const descContent = [
+    screenshotUrl
+      ? { type: 'mediaSingle', attrs: { layout: 'center' }, content: [{ type: 'media', attrs: { type: 'external', url: screenshotUrl } }] }
+      : null,
+    textLine('URL', report.url),
+    textLine('Page', report.pagePath || '/'),
+    report.browser ? textLine('Browser', report.browser) : null,
+    report.os ? textLine('OS', report.os) : null,
+    report.viewport ? textLine('Viewport', report.viewport) : null,
+    report.cssPath
+      ? {
+          type: 'paragraph',
+          content: [
+            { type: 'text', text: 'Element: ', marks: [{ type: 'strong' }] },
+            { type: 'text', text: report.cssPath, marks: [{ type: 'code' }] },
+          ],
+        }
+      : null,
+    { type: 'rule' },
+    { type: 'paragraph', content: [{ type: 'text', text: 'Description: ', marks: [{ type: 'strong' }] }] },
+    { type: 'paragraph', content: [{ type: 'text', text: report.comment }] },
+    { type: 'rule' },
+    {
+      type: 'paragraph',
+      content: [
+        { type: 'text', text: 'Captured via ' },
+        { type: 'text', text: 'Annoture', marks: [{ type: 'link', attrs: { href: 'https://annoture.com' } }] },
+        { type: 'text', text: ` by ${report.userName}` },
+      ],
+    },
+  ].filter(Boolean);
+
+  const issueRes = await axios.post(
+    `https://api.atlassian.com/ex/jira/${cloudId}/rest/api/3/issue`,
+    {
+      fields: {
+        project: { key: projectKey },
+        summary: report.title,
+        issuetype: { name: issueType },
+        description: { version: 1, type: 'doc', content: descContent },
+      },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+    },
+  );
+
+  const issueKey = issueRes.data.key;
+  return { key: issueKey, url: `${cloudUrl}/browse/${issueKey}` };
+}
+
+// GET /api/jira/connect
+app.get('/api/jira/connect', authenticateToken, (req, res) => {
+  const { siteSlug } = req.query;
+  const state = crypto.randomBytes(16).toString('hex');
+  const isProd = process.env.NODE_ENV === 'production';
+  const cookieOpts = { httpOnly: true, path: '/', maxAge: 10 * 60 * 1000, sameSite: 'lax', ...(isProd && { secure: true }) };
+  res.cookie('jira_oauth_state', state, cookieOpts);
+  if (siteSlug) res.cookie('jira_oauth_return', siteSlug, cookieOpts);
+  const params = new URLSearchParams({
+    audience: 'api.atlassian.com',
+    client_id: process.env.JIRA_CLIENT_ID,
+    scope: 'read:jira-work write:jira-work offline_access',
+    redirect_uri: `${process.env.BACKEND_URL || `http://localhost:${PORT}`}/api/jira/connect/callback`,
+    state,
+    response_type: 'code',
+    prompt: 'consent',
+  });
+  res.redirect(`https://auth.atlassian.com/authorize?${params}`);
+});
+
+// GET /api/jira/connect/callback
+app.get('/api/jira/connect/callback', async (req, res) => {
+  const { code, error, state } = req.query;
+  const frontendUrl = process.env.APP_URL || 'http://localhost:3000';
+  const expectedState = req.cookies?.jira_oauth_state;
+  const returnSlug = req.cookies?.jira_oauth_return || '';
+  const isProd = process.env.NODE_ENV === 'production';
+  const clearOpts = { httpOnly: true, path: '/', sameSite: 'lax', ...(isProd && { secure: true }) };
+  res.clearCookie('jira_oauth_state', clearOpts);
+  res.clearCookie('jira_oauth_return', clearOpts);
+
+  if (!state || !expectedState || state !== expectedState) {
+    return res.redirect(`${frontendUrl}/reports/${returnSlug}/settings?jira=error`);
+  }
+  if (error || !code) {
+    return res.redirect(`${frontendUrl}/reports/${returnSlug}/settings?jira=cancelled`);
+  }
+
+  const token = req.cookies?.token;
+  if (!token) return res.redirect(`${frontendUrl}/login?next=/reports/${returnSlug}/settings`);
+  let userId;
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    userId = payload.id;
+  } catch {
+    return res.redirect(`${frontendUrl}/login?next=/reports/${returnSlug}/settings`);
+  }
+
+  try {
+    const tokenRes = await axios.post(
+      'https://auth.atlassian.com/oauth/token',
+      {
+        grant_type: 'authorization_code',
+        client_id: process.env.JIRA_CLIENT_ID,
+        client_secret: process.env.JIRA_CLIENT_SECRET,
+        code,
+        redirect_uri: `${process.env.BACKEND_URL || `http://localhost:${PORT}`}/api/jira/connect/callback`,
+      },
+      { headers: { 'Content-Type': 'application/json' } },
+    );
+
+    const { access_token, refresh_token, expires_in } = tokenRes.data;
+    const expiresAt = new Date(Date.now() + expires_in * 1000 - 60_000);
+
+    await prisma.jiraIntegration.upsert({
+      where: { userId },
+      update: { accessToken: access_token, refreshToken: refresh_token, expiresAt, updatedAt: new Date() },
+      create: { userId, accessToken: access_token, refreshToken: refresh_token, expiresAt },
+    });
+
+    res.redirect(`${frontendUrl}/reports/${returnSlug}/settings?jira=connected`);
+  } catch (err) {
+    captureError('Jira OAuth error:', err?.response?.data || err.message);
+    res.redirect(`${frontendUrl}/reports/${returnSlug}/settings?jira=error`);
+  }
+});
+
+// GET /api/jira/status
+app.get('/api/jira/status', authenticateToken, async (req, res) => {
+  try {
+    const integration = await prisma.jiraIntegration.findUnique({
+      where: { userId: req.user.id },
+      select: { id: true, createdAt: true },
+    });
+    res.json({ connected: !!integration });
+  } catch (err) {
+    captureError('Jira status error:', err);
+    res.status(500).json({ error: 'Failed to check Jira status' });
+  }
+});
+
+// DELETE /api/jira/disconnect
+app.delete('/api/jira/disconnect', authenticateToken, async (req, res) => {
+  try {
+    await prisma.jiraIntegration.deleteMany({ where: { userId: req.user.id } });
+    res.json({ ok: true });
+  } catch (err) {
+    captureError('Jira disconnect error:', err);
+    res.status(500).json({ error: 'Failed to disconnect Jira' });
+  }
+});
+
+// GET /api/jira/clouds — list accessible Jira cloud instances
+app.get('/api/jira/clouds', authenticateToken, async (req, res) => {
+  try {
+    const integration = await prisma.jiraIntegration.findUnique({ where: { userId: req.user.id } });
+    if (!integration) return res.status(404).json({ error: 'Jira not connected' });
+    const token = await getValidJiraToken(integration);
+    const r = await axios.get('https://api.atlassian.com/oauth/token/accessible-resources', {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    });
+    res.json(r.data.map((site) => ({ id: site.id, name: site.name, url: site.url })));
+  } catch (err) {
+    captureError('Jira clouds error:', err?.response?.data || err.message);
+    if (err?.response?.status === 401) return res.status(401).json({ error: 'Jira token expired — please reconnect' });
+    res.status(500).json({ error: 'Failed to fetch Jira sites' });
+  }
+});
+
+// GET /api/jira/clouds/:cloudId/projects — list projects for a cloud instance
+app.get('/api/jira/clouds/:cloudId/projects', authenticateToken, async (req, res) => {
+  try {
+    const integration = await prisma.jiraIntegration.findUnique({ where: { userId: req.user.id } });
+    if (!integration) return res.status(404).json({ error: 'Jira not connected' });
+    const token = await getValidJiraToken(integration);
+    const r = await axios.get(
+      `https://api.atlassian.com/ex/jira/${req.params.cloudId}/rest/api/3/project/search?maxResults=100`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } },
+    );
+    res.json(r.data.values.map((p) => ({ key: p.key, name: p.name, type: p.projectTypeKey })));
+  } catch (err) {
+    captureError('Jira projects error:', err?.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch Jira projects' });
+  }
+});
+
+// GET /api/jira/sites/:siteId/integration
+app.get('/api/jira/sites/:siteId/integration', authenticateToken, async (req, res) => {
+  try {
+    const config = await prisma.siteJiraConfig.findUnique({
+      where: { siteId: req.params.siteId },
+      select: { cloudId: true, cloudUrl: true, projectKey: true, issueType: true, enabled: true },
+    });
+    res.json(config || null);
+  } catch (err) {
+    captureError('Jira site config fetch error:', err);
+    res.status(500).json({ error: 'Failed to fetch Jira integration' });
+  }
+});
+
+// POST /api/jira/sites/:siteId/integration
+app.post('/api/jira/sites/:siteId/integration', authenticateToken, async (req, res) => {
+  const { cloudId, cloudUrl, projectKey, issueType = 'Bug', enabled = true } = req.body;
+  if (!cloudId || !projectKey) return res.status(400).json({ error: 'cloudId and projectKey are required' });
+  try {
+    const integration = await prisma.jiraIntegration.findUnique({ where: { userId: req.user.id } });
+    if (!integration) return res.status(404).json({ error: 'Jira not connected' });
+    const config = await prisma.siteJiraConfig.upsert({
+      where: { siteId: req.params.siteId },
+      update: { cloudId, cloudUrl, projectKey, issueType, enabled, integrationId: integration.id },
+      create: { siteId: req.params.siteId, cloudId, cloudUrl, projectKey, issueType, enabled, integrationId: integration.id },
+    });
+    res.json(config);
+  } catch (err) {
+    captureError('Jira site config save error:', err);
+    res.status(500).json({ error: 'Failed to save Jira integration' });
+  }
+});
+
+// DELETE /api/jira/sites/:siteId/integration
+app.delete('/api/jira/sites/:siteId/integration', authenticateToken, async (req, res) => {
+  try {
+    await prisma.siteJiraConfig.deleteMany({ where: { siteId: req.params.siteId } });
+    res.json({ ok: true });
+  } catch (err) {
+    captureError('Jira site config delete error:', err);
+    res.status(500).json({ error: 'Failed to remove Jira integration' });
+  }
+});
+
+// POST /api/jira/sites/:siteId/push/:reportId — manually push an existing report
+app.post('/api/jira/sites/:siteId/push/:reportId', authenticateToken, async (req, res) => {
+  try {
+    const integration = await prisma.jiraIntegration.findUnique({ where: { userId: req.user.id } });
+    if (!integration) return res.status(404).json({ error: 'Jira not connected' });
+    const config = await prisma.siteJiraConfig.findUnique({ where: { siteId: req.params.siteId } });
+    if (!config || !config.enabled) return res.status(404).json({ error: 'Jira integration not configured for this site' });
+    const report = await prisma.qAReport.findUnique({ where: { id: req.params.reportId } });
+    if (!report) return res.status(404).json({ error: 'Report not found' });
+    if (report.jiraIssueUrl) return res.status(409).json({ error: 'Report already pushed to Jira', url: report.jiraIssueUrl });
+    const issue = await createJiraIssue(integration, config.cloudId, config.cloudUrl, config.projectKey, config.issueType, report);
+    const updated = await prisma.qAReport.update({
+      where: { id: report.id },
+      data: { jiraIssueKey: issue.key, jiraIssueUrl: issue.url },
+    });
+    res.json({ jiraIssueKey: updated.jiraIssueKey, jiraIssueUrl: updated.jiraIssueUrl });
+  } catch (err) {
+    captureError('Jira manual push error:', err?.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to create Jira issue' });
   }
 });
 
